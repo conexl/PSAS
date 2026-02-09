@@ -81,18 +81,32 @@ sudo install -m 0755 psasctl /usr/local/bin/psasctl
 
 ```bash
 psasctl status
+psasctl status --json
 psasctl admin-url
 
 psasctl users list
+psasctl users list --enabled
+psasctl users find user01
 psasctl users add --name test --days 30 --gb 100 --mode no_reset
-psasctl users links <UUID>
-psasctl users show <UUID>
-psasctl users del <UUID>
+psasctl users add --name test --json
+
+# USER_ID = UUID или имя пользователя
+psasctl users links <USER_ID>
+psasctl users show <USER_ID>
+psasctl users del <USER_ID>
+# пример по имени:
+psasctl users links user01
 
 psasctl config get reality_enable
 psasctl config set vmess_enable false
 
 psasctl apply
+```
+
+Можно использовать короткий алиас:
+
+```bash
+psasctl u list
 ```
 
 Переменные окружения:
@@ -115,4 +129,3 @@ sudo hiddify-apply-safe <your-domain>
 - Скрипт **не меняет `sshd_config`**.
 - До запуска убедитесь, что A-запись домена указывает на VPS.
 - На новой VPS лучше запускать installer в чистой системе.
-

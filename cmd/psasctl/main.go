@@ -48,6 +48,16 @@ type apiUser struct {
 	Mode         string  `json:"mode"`
 }
 
+type linkSet struct {
+	UUID     string `json:"uuid"`
+	Host     string `json:"host"`
+	Panel    string `json:"panel"`
+	Auto     string `json:"auto"`
+	Sub64    string `json:"sub64"`
+	Sub      string `json:"sub"`
+	Singbox  string `json:"singbox"`
+}
+
 type client struct {
 	panelCfg  string
 	panelAddr string
@@ -71,7 +81,7 @@ func main() {
 		runStatus(args)
 	case "admin-url":
 		runAdminURL(args)
-	case "users":
+	case "users", "user", "u":
 		runUsers(args)
 	case "config":
 		runConfig(args)
@@ -88,16 +98,19 @@ func usage() {
 	fmt.Println(`psasctl - Hiddify manager helper
 
 Usage:
-  psasctl status
+  psasctl status [--json]
   psasctl admin-url
-  psasctl users list
-  psasctl users add --name NAME [--days 30] [--gb 100] [--mode no_reset] [--host DOMAIN]
-  psasctl users show <UUID>
-  psasctl users links <UUID> [--host DOMAIN]
-  psasctl users del <UUID>
+  psasctl users list [--name QUERY] [--enabled] [--json]
+  psasctl users find [--enabled] [--json] <QUERY>
+  psasctl users add --name NAME [--days 30] [--gb 100] [--mode no_reset] [--host DOMAIN] [--uuid UUID] [--json]
+  psasctl users show [--host DOMAIN] [--json] <USER_ID>
+  psasctl users links [--host DOMAIN] [--json] <USER_ID>
+  psasctl users del <USER_ID>
   psasctl config get <key>
   psasctl config set <key> <value>
   psasctl apply
+
+USER_ID can be UUID or user name (exact/substring match).
 
 Environment overrides:
   PSAS_PANEL_CFG   (default /opt/hiddify-manager/hiddify-panel/app.cfg)
@@ -107,12 +120,30 @@ Environment overrides:
 }
 
 func runStatus(args []string) {
-	if len(args) != 0 {
-		fatalf("status takes no args")
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	jsonOut := fs.Bool("json", false, "output JSON")
+	must(fs.Parse(args))
+	if len(fs.Args()) != 0 {
+		fatalf("status takes no positional args")
 	}
 	c := mustClient(true)
 	mainDomain := c.mainDomain()
 	cfg := c.currentConfig()
+
+	out := map[string]any{
+		"main_domain":        mainDomain,
+		"admin_url":          c.adminURL(mainDomain),
+		"client_path":        cfg["proxy_path_client"],
+		"reality_enabled":    cfg["reality_enable"],
+		"hysteria2_enabled":  cfg["hysteria_enable"],
+		"hysteria_base_port": cfg["hysteria_port"],
+		"reality_sni":        cfg["reality_server_names"],
+		"users":              len(c.state.Users),
+	}
+	if *jsonOut {
+		printJSON(out)
+		return
+	}
 
 	fmt.Printf("Main domain: %s\n", mainDomain)
 	fmt.Printf("Admin URL: %s\n", c.adminURL(mainDomain))
@@ -129,12 +160,12 @@ func runAdminURL(args []string) {
 		fatalf("admin-url takes no args")
 	}
 	c := mustClient(true)
-	fmt.Println(c.adminURL(c.mainDomain()))
+	fmt.Println(c.adminURL(c.mainDomainRequired()))
 }
 
 func runUsers(args []string) {
 	if len(args) < 1 {
-		fatalf("users requires subcommand: list|add|show|links|del")
+		fatalf("users requires subcommand: list|find|add|show|links|del")
 	}
 	c := mustClient(true)
 
@@ -142,38 +173,89 @@ func runUsers(args []string) {
 	subArgs := args[1:]
 
 	switch sub {
-	case "list":
-		if len(subArgs) != 0 {
-			fatalf("users list takes no args")
+	case "list", "ls":
+		fs := flag.NewFlagSet("list", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		enabledOnly := fs.Bool("enabled", false, "show only enabled users")
+		nameFilter := fs.String("name", "", "name contains (case-insensitive)")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("users list takes no positional args")
 		}
 		users, err := c.usersList()
 		must(err)
-		printUsers(users)
-	case "show":
-		if len(subArgs) != 1 {
-			fatalf("users show requires UUID")
+		users = filterUsers(users, *nameFilter, *enabledOnly)
+		if *jsonOut {
+			printJSON(users)
+			return
 		}
-		uuid := subArgs[0]
-		mustValidUUID(uuid)
-		u, err := c.userShow(uuid)
-		must(err)
-		b, _ := json.MarshalIndent(u, "", "  ")
-		fmt.Println(string(b))
-	case "links":
-		fs := flag.NewFlagSet("links", flag.ExitOnError)
-		host := fs.String("host", "", "domain for generated links")
+		printUsers(users)
+	case "find":
+		fs := flag.NewFlagSet("find", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		enabledOnly := fs.Bool("enabled", false, "show only enabled users")
 		must(fs.Parse(subArgs))
 		rest := fs.Args()
 		if len(rest) != 1 {
-			fatalf("users links requires UUID")
+			fatalf("users find requires QUERY")
 		}
-		uuid := rest[0]
-		mustValidUUID(uuid)
+		users, err := c.usersList()
+		must(err)
+		users = filterUsers(users, rest[0], *enabledOnly)
+		if *jsonOut {
+			printJSON(users)
+			return
+		}
+		printUsers(users)
+	case "show":
+		fs := flag.NewFlagSet("show", flag.ExitOnError)
+		host := fs.String("host", "", "domain for generated links")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("users show requires USER_ID")
+		}
+		u, err := c.resolveUser(rest[0])
+		must(err)
+		h := strings.TrimSpace(*host)
+		if h == "" {
+			h = c.mainDomainRequired()
+		}
+		links := buildLinks(c.clientPath(), u.UUID, h)
+		if *jsonOut {
+			printJSON(map[string]any{
+				"user":  u,
+				"links": links,
+			})
+			return
+		}
+		printUser(u)
+		printLinksFromSet(links)
+	case "links":
+		fs := flag.NewFlagSet("links", flag.ExitOnError)
+		host := fs.String("host", "", "domain for generated links")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("users links requires USER_ID")
+		}
+		u, err := c.resolveUser(rest[0])
+		must(err)
 		h := *host
 		if h == "" {
-			h = c.mainDomain()
+			h = c.mainDomainRequired()
 		}
-		printLinks(c.clientPath(), uuid, h)
+		links := buildLinks(c.clientPath(), u.UUID, h)
+		if *jsonOut {
+			printJSON(map[string]any{
+				"user":  u,
+				"links": links,
+			})
+			return
+		}
+		printLinksFromSet(links)
 	case "add":
 		fs := flag.NewFlagSet("add", flag.ExitOnError)
 		name := fs.String("name", "", "user name")
@@ -181,16 +263,32 @@ func runUsers(args []string) {
 		gb := fs.Float64("gb", 100, "usage limit in GB")
 		mode := fs.String("mode", "no_reset", "user mode: no_reset|daily|weekly|monthly")
 		host := fs.String("host", "", "domain for generated links")
+		uuid := fs.String("uuid", "", "custom UUID (optional)")
+		jsonOut := fs.Bool("json", false, "output JSON")
 		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("users add takes only flags")
+		}
 		if *name == "" {
 			fatalf("--name is required")
 		}
 		if !isValidMode(*mode) {
 			fatalf("invalid --mode: %s", *mode)
 		}
-		uuid := newUUID()
+		if *days < 1 {
+			fatalf("--days must be >= 1")
+		}
+		if *gb <= 0 {
+			fatalf("--gb must be > 0")
+		}
+		newID := strings.TrimSpace(*uuid)
+		if newID == "" {
+			newID = newUUID()
+		} else {
+			mustValidUUID(newID)
+		}
 		payload := map[string]any{
-			"uuid":           uuid,
+			"uuid":           strings.ToLower(newID),
 			"name":           *name,
 			"package_days":   *days,
 			"usage_limit_GB": *gb,
@@ -201,17 +299,25 @@ func runUsers(args []string) {
 		must(err)
 		h := *host
 		if h == "" {
-			h = c.mainDomain()
+			h = c.mainDomainRequired()
 		}
-		printLinks(c.clientPath(), u.UUID, h)
+		links := buildLinks(c.clientPath(), u.UUID, h)
+		if *jsonOut {
+			printJSON(map[string]any{
+				"user":  u,
+				"links": links,
+			})
+			return
+		}
+		printLinksFromSet(links)
 	case "del", "delete", "rm":
 		if len(subArgs) != 1 {
-			fatalf("users del requires UUID")
+			fatalf("users del requires USER_ID")
 		}
-		uuid := subArgs[0]
-		mustValidUUID(uuid)
-		must(c.userDelete(uuid))
-		fmt.Printf("Deleted: %s\n", uuid)
+		u, err := c.resolveUser(subArgs[0])
+		must(err)
+		must(c.userDelete(u.UUID))
+		fmt.Printf("Deleted: %s (%s)\n", u.UUID, u.Name)
 	default:
 		fatalf("unknown users subcommand: %s", sub)
 	}
@@ -255,7 +361,7 @@ func runApply(args []string) {
 		fatalf("apply takes no args")
 	}
 	c := mustClient(true)
-	mainDomain := c.mainDomain()
+	mainDomain := c.mainDomainRequired()
 
 	if fileExists("/usr/local/bin/hiddify-apply-safe") {
 		must(runCommand("/usr/local/bin/hiddify-apply-safe", mainDomain))
@@ -397,6 +503,56 @@ func (c *client) userDelete(uuid string) error {
 	return err
 }
 
+func (c *client) resolveUser(id string) (apiUser, error) {
+	key := strings.TrimSpace(id)
+	if key == "" {
+		return apiUser{}, errors.New("empty USER_ID")
+	}
+	if uuidRe.MatchString(key) {
+		u, err := c.userShow(strings.ToLower(key))
+		if err != nil {
+			return apiUser{}, fmt.Errorf("user not found by UUID: %s", key)
+		}
+		return u, nil
+	}
+
+	users, err := c.usersList()
+	if err != nil {
+		return apiUser{}, err
+	}
+	if len(users) == 0 {
+		return apiUser{}, errors.New("no users in panel")
+	}
+
+	var exact []apiUser
+	for _, u := range users {
+		if strings.EqualFold(strings.TrimSpace(u.Name), key) {
+			exact = append(exact, u)
+		}
+	}
+	if len(exact) == 1 {
+		return exact[0], nil
+	}
+	if len(exact) > 1 {
+		return apiUser{}, fmt.Errorf("multiple users have name %q: %s", key, formatUserRefs(exact))
+	}
+
+	var partial []apiUser
+	lkey := strings.ToLower(key)
+	for _, u := range users {
+		if strings.Contains(strings.ToLower(u.Name), lkey) {
+			partial = append(partial, u)
+		}
+	}
+	if len(partial) == 1 {
+		return partial[0], nil
+	}
+	if len(partial) == 0 {
+		return apiUser{}, fmt.Errorf("user not found by name/UUID: %s", key)
+	}
+	return apiUser{}, fmt.Errorf("multiple matches for %q: %s", key, formatUserRefs(partial))
+}
+
 func (c *client) setConfig(key, value string) error {
 	_, err := c.runPanel("set-setting", "-k", key, "-v", value)
 	return err
@@ -427,6 +583,14 @@ func (c *client) mainDomain() string {
 	return ""
 }
 
+func (c *client) mainDomainRequired() string {
+	h := strings.TrimSpace(c.mainDomain())
+	if h == "" {
+		fatalf("main domain not found in Hiddify domains; pass --host explicitly")
+	}
+	return h
+}
+
 func (c *client) clientPath() string {
 	v := c.currentConfig()["proxy_path_client"]
 	if s, ok := v.(string); ok {
@@ -448,14 +612,84 @@ func printUsers(users []apiUser) {
 	_ = tw.Flush()
 }
 
-func printLinks(clientPath, uuid, host string) {
-	base := fmt.Sprintf("https://%s/%s/%s", strings.TrimSpace(host), strings.Trim(clientPath, "/"), uuid)
-	fmt.Printf("User UUID: %s\n", uuid)
-	fmt.Printf("Panel URL: %s/\n", base)
-	fmt.Printf("Hiddify (auto): %s/auto/\n", base)
-	fmt.Printf("Subscription b64: %s/sub64/\n", base)
-	fmt.Printf("Subscription plain: %s/sub/\n", base)
-	fmt.Printf("Sing-box: %s/singbox/\n", base)
+func filterUsers(users []apiUser, nameFilter string, enabledOnly bool) []apiUser {
+	if nameFilter == "" && !enabledOnly {
+		return users
+	}
+	out := make([]apiUser, 0, len(users))
+	q := strings.ToLower(strings.TrimSpace(nameFilter))
+	for _, u := range users {
+		if enabledOnly && !u.Enable {
+			continue
+		}
+		if q != "" && !strings.Contains(strings.ToLower(u.Name), q) {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
+func printUser(u apiUser) {
+	fmt.Printf("UUID: %s\n", u.UUID)
+	fmt.Printf("Name: %s\n", u.Name)
+	fmt.Printf("Enabled: %t\n", u.Enable)
+	fmt.Printf("Limit GB: %.2f\n", u.UsageLimitGB)
+	fmt.Printf("Days: %d\n", u.PackageDays)
+	fmt.Printf("Mode: %s\n", u.Mode)
+}
+
+func buildLinks(clientPath, uuid, host string) linkSet {
+	base := fmt.Sprintf("https://%s/%s/%s", strings.TrimSpace(host), strings.Trim(clientPath, "/"), strings.TrimSpace(uuid))
+	return linkSet{
+		UUID:    strings.TrimSpace(uuid),
+		Host:    strings.TrimSpace(host),
+		Panel:   base + "/",
+		Auto:    base + "/auto/",
+		Sub64:   base + "/sub64/",
+		Sub:     base + "/sub/",
+		Singbox: base + "/singbox/",
+	}
+}
+
+func printLinksFromSet(l linkSet) {
+	fmt.Printf("User UUID: %s\n", l.UUID)
+	fmt.Printf("Panel URL: %s\n", l.Panel)
+	fmt.Printf("Hiddify (auto): %s\n", l.Auto)
+	fmt.Printf("Subscription b64: %s\n", l.Sub64)
+	fmt.Printf("Subscription plain: %s\n", l.Sub)
+	fmt.Printf("Sing-box: %s\n", l.Singbox)
+}
+
+func formatUserRefs(users []apiUser) string {
+	if len(users) == 0 {
+		return ""
+	}
+	const maxItems = 5
+	items := make([]string, 0, min(len(users), maxItems))
+	for i, u := range users {
+		if i >= maxItems {
+			break
+		}
+		items = append(items, fmt.Sprintf("%s(%s)", u.Name, u.UUID))
+	}
+	if len(users) > maxItems {
+		items = append(items, fmt.Sprintf("+%d more", len(users)-maxItems))
+	}
+	return strings.Join(items, ", ")
+}
+
+func printJSON(v any) {
+	b, err := json.MarshalIndent(v, "", "  ")
+	must(err)
+	fmt.Println(string(b))
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func isValidMode(m string) bool {

@@ -24,15 +24,18 @@ hiddify-sub add --name user01 --days 30 --gb 300 --mode no_reset
 ```bash
 # Проверка статуса
 psasctl status
+psasctl status --json
 
 # Админ-ссылка
 psasctl admin-url
 
 # Пользователи
 psasctl users list
-psasctl users show <UUID>
-psasctl users links <UUID>
-psasctl users del <UUID>
+psasctl users list --enabled
+psasctl users find ivan
+psasctl users show <USER_ID>
+psasctl users links <USER_ID>
+psasctl users del <USER_ID>
 
 # Конфиг
 psasctl config get hysteria_enable
@@ -46,8 +49,9 @@ hiddify-apply-safe <your-domain>
 
 ## Примечание по UUID
 
-Команды `show/links/del` принимают именно UUID формата:
+`USER_ID` в командах `show/links/del` может быть:
+- UUID формата:
 
 `6098ea35-8cb2-4a08-ba15-2be25bc49cb6`
 
-а не имя пользователя.
+- или имя пользователя (точное/частичное совпадение).
