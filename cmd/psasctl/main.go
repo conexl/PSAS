@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 )
@@ -81,6 +83,8 @@ func main() {
 		runStatus(args)
 	case "admin-url":
 		runAdminURL(args)
+	case "ui", "menu", "interactive":
+		runUI(args)
 	case "users", "user", "u":
 		runUsers(args)
 	case "config":
@@ -100,6 +104,7 @@ func usage() {
 Usage:
   psasctl status [--json]
   psasctl admin-url
+  psasctl ui
   psasctl users list [--name QUERY] [--enabled] [--json]
   psasctl users find [--enabled] [--json] <QUERY>
   psasctl users add --name NAME [--days 30] [--gb 100] [--mode no_reset] [--host DOMAIN] [--uuid UUID] [--json]
@@ -361,15 +366,302 @@ func runApply(args []string) {
 		fatalf("apply takes no args")
 	}
 	c := mustClient(true)
-	mainDomain := c.mainDomainRequired()
+	must(applyWithClient(c))
+}
 
-	if fileExists("/usr/local/bin/hiddify-apply-safe") {
-		must(runCommand("/usr/local/bin/hiddify-apply-safe", mainDomain))
-		fmt.Println("Applied with hiddify-apply-safe")
-		return
+func applyWithClient(c *client) error {
+	mainDomain, err := c.mainDomainOrErr()
+	if err != nil {
+		return err
 	}
-	must(runCommand("/opt/hiddify-manager/common/commander.py", "apply"))
+	if fileExists("/usr/local/bin/hiddify-apply-safe") {
+		if err := runCommand("/usr/local/bin/hiddify-apply-safe", mainDomain); err != nil {
+			return err
+		}
+		fmt.Println("Applied with hiddify-apply-safe")
+		return nil
+	}
+	if err := runCommand("/opt/hiddify-manager/common/commander.py", "apply"); err != nil {
+		return err
+	}
 	fmt.Println("Applied with /opt/hiddify-manager/common/commander.py apply")
+	return nil
+}
+
+func runUI(args []string) {
+	if len(args) != 0 {
+		fatalf("ui takes no args")
+	}
+	if !isInteractiveTerminal() {
+		fatalf("ui mode requires an interactive terminal")
+	}
+
+	c := mustClient(true)
+	in := bufio.NewReader(os.Stdin)
+
+	for {
+		fmt.Println("psasctl interactive menu")
+		fmt.Println("  1) Status")
+		fmt.Println("  2) List users")
+		fmt.Println("  3) Find users")
+		fmt.Println("  4) Show user + links")
+		fmt.Println("  5) Add user")
+		fmt.Println("  6) Delete user")
+		fmt.Println("  7) Admin URL")
+		fmt.Println("  8) Apply config")
+		fmt.Println("  0) Exit")
+
+		choice, err := promptLine(in, "Choose option", "")
+		if err != nil {
+			fatalf("ui input error: %v", err)
+		}
+
+		switch strings.ToLower(strings.TrimSpace(choice)) {
+		case "1", "status":
+			if err := uiStatus(c); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+		case "2", "list":
+			if err := uiListUsers(c); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+		case "3", "find":
+			if err := uiFindUsers(c, in); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+		case "4", "show":
+			if err := uiShowUser(c, in); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+		case "5", "add":
+			if err := uiAddUser(c, in); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+		case "6", "delete", "del", "rm":
+			if err := uiDeleteUser(c, in); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+		case "7", "admin", "admin-url":
+			if err := uiAdminURL(c); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+		case "8", "apply":
+			if err := applyWithClient(c); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+		case "0", "q", "quit", "exit":
+			return
+		default:
+			fmt.Printf("Unknown option: %q\n", choice)
+		}
+		fmt.Println()
+	}
+}
+
+func uiStatus(c *client) error {
+	if err := c.loadState(); err != nil {
+		return err
+	}
+	cfg := c.currentConfig()
+	mainDomain := c.mainDomain()
+
+	fmt.Printf("Main domain: %s\n", mainDomain)
+	fmt.Printf("Admin URL: %s\n", c.adminURL(mainDomain))
+	fmt.Printf("Client path: %v\n", cfg["proxy_path_client"])
+	fmt.Printf("Reality enabled: %v\n", cfg["reality_enable"])
+	fmt.Printf("Hysteria2 enabled: %v\n", cfg["hysteria_enable"])
+	fmt.Printf("Hysteria base port: %v\n", cfg["hysteria_port"])
+	fmt.Printf("Reality SNI: %v\n", cfg["reality_server_names"])
+	fmt.Printf("Users: %d\n", len(c.state.Users))
+	return nil
+}
+
+func uiListUsers(c *client) error {
+	if err := c.loadState(); err != nil {
+		return err
+	}
+	users, err := c.usersList()
+	if err != nil {
+		return err
+	}
+	printUsers(users)
+	return nil
+}
+
+func uiFindUsers(c *client, in *bufio.Reader) error {
+	if err := c.loadState(); err != nil {
+		return err
+	}
+	query, err := promptRequiredLine(in, "Find by name/part")
+	if err != nil {
+		return err
+	}
+	enabledRaw, err := promptLine(in, "Only enabled? (y/N)", "n")
+	if err != nil {
+		return err
+	}
+	users, err := c.usersList()
+	if err != nil {
+		return err
+	}
+	users = filterUsers(users, query, isYes(enabledRaw))
+	if len(users) == 0 {
+		fmt.Println("No users found.")
+		return nil
+	}
+	printUsers(users)
+	return nil
+}
+
+func uiShowUser(c *client, in *bufio.Reader) error {
+	if err := c.loadState(); err != nil {
+		return err
+	}
+	id, err := promptRequiredLine(in, "USER_ID (UUID or name)")
+	if err != nil {
+		return err
+	}
+	u, err := c.resolveUser(id)
+	if err != nil {
+		return err
+	}
+	host, err := promptLine(in, "Host for links (empty = main domain)", "")
+	if err != nil {
+		return err
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host, err = c.mainDomainOrErr()
+		if err != nil {
+			return err
+		}
+	}
+	links := buildLinks(c.clientPath(), u.UUID, host)
+	printUser(u)
+	printLinksFromSet(links)
+	return nil
+}
+
+func uiAddUser(c *client, in *bufio.Reader) error {
+	if err := c.loadState(); err != nil {
+		return err
+	}
+
+	name, err := promptRequiredLine(in, "User name")
+	if err != nil {
+		return err
+	}
+
+	daysStr, err := promptLine(in, "Package days", "30")
+	if err != nil {
+		return err
+	}
+	days, err := parsePositiveInt(daysStr)
+	if err != nil {
+		return fmt.Errorf("invalid days: %w", err)
+	}
+
+	gbStr, err := promptLine(in, "Usage limit (GB)", "100")
+	if err != nil {
+		return err
+	}
+	gb, err := parsePositiveFloat(gbStr)
+	if err != nil {
+		return fmt.Errorf("invalid GB: %w", err)
+	}
+
+	mode, err := promptLine(in, "Mode (no_reset|daily|weekly|monthly)", "no_reset")
+	if err != nil {
+		return err
+	}
+	mode = strings.TrimSpace(mode)
+	if !isValidMode(mode) {
+		return fmt.Errorf("invalid mode: %s", mode)
+	}
+
+	id, err := promptLine(in, "Custom UUID (empty = auto)", "")
+	if err != nil {
+		return err
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = newUUID()
+	} else {
+		if err := validateUUID(id); err != nil {
+			return err
+		}
+		id = strings.ToLower(id)
+	}
+
+	host, err := promptLine(in, "Host for links (empty = main domain)", "")
+	if err != nil {
+		return err
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host, err = c.mainDomainOrErr()
+		if err != nil {
+			return err
+		}
+	}
+
+	payload := map[string]any{
+		"uuid":           id,
+		"name":           name,
+		"package_days":   days,
+		"usage_limit_GB": gb,
+		"mode":           mode,
+		"enable":         true,
+	}
+	u, err := c.userAdd(payload)
+	if err != nil {
+		return err
+	}
+	links := buildLinks(c.clientPath(), u.UUID, host)
+	fmt.Println("User created.")
+	printLinksFromSet(links)
+	return nil
+}
+
+func uiDeleteUser(c *client, in *bufio.Reader) error {
+	if err := c.loadState(); err != nil {
+		return err
+	}
+	id, err := promptRequiredLine(in, "USER_ID to delete (UUID or name)")
+	if err != nil {
+		return err
+	}
+	u, err := c.resolveUser(id)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("About to delete: %s (%s)\n", u.UUID, u.Name)
+	confirm, err := promptLine(in, "Confirm delete? (yes/no)", "no")
+	if err != nil {
+		return err
+	}
+	if !isYes(confirm) {
+		fmt.Println("Canceled.")
+		return nil
+	}
+	if err := c.userDelete(u.UUID); err != nil {
+		return err
+	}
+	fmt.Printf("Deleted: %s (%s)\n", u.UUID, u.Name)
+	return nil
+}
+
+func uiAdminURL(c *client) error {
+	if err := c.loadState(); err != nil {
+		return err
+	}
+	host, err := c.mainDomainOrErr()
+	if err != nil {
+		return err
+	}
+	fmt.Println(c.adminURL(host))
+	return nil
 }
 
 func mustClient(loadState bool) *client {
@@ -583,10 +875,18 @@ func (c *client) mainDomain() string {
 	return ""
 }
 
-func (c *client) mainDomainRequired() string {
+func (c *client) mainDomainOrErr() (string, error) {
 	h := strings.TrimSpace(c.mainDomain())
 	if h == "" {
-		fatalf("main domain not found in Hiddify domains; pass --host explicitly")
+		return "", errors.New("main domain not found in Hiddify domains; pass --host explicitly")
+	}
+	return h, nil
+}
+
+func (c *client) mainDomainRequired() string {
+	h, err := c.mainDomainOrErr()
+	if err != nil {
+		fatalf("%v", err)
 	}
 	return h
 }
@@ -692,6 +992,75 @@ func min(a, b int) int {
 	return b
 }
 
+func isInteractiveTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func promptLine(in *bufio.Reader, label, def string) (string, error) {
+	if def != "" {
+		fmt.Printf("%s [%s]: ", label, def)
+	} else {
+		fmt.Printf("%s: ", label)
+	}
+	s, err := in.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def, nil
+	}
+	return s, nil
+}
+
+func promptRequiredLine(in *bufio.Reader, label string) (string, error) {
+	for {
+		s, err := promptLine(in, label, "")
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(s) != "" {
+			return s, nil
+		}
+		fmt.Println("Value is required.")
+	}
+}
+
+func parsePositiveInt(s string) (int, error) {
+	v, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0, err
+	}
+	if v <= 0 {
+		return 0, errors.New("must be > 0")
+	}
+	return v, nil
+}
+
+func parsePositiveFloat(s string) (float64, error) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0, err
+	}
+	if v <= 0 {
+		return 0, errors.New("must be > 0")
+	}
+	return v, nil
+}
+
+func isYes(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "y", "yes", "1", "true":
+		return true
+	default:
+		return false
+	}
+}
+
 func isValidMode(m string) bool {
 	switch m {
 	case "no_reset", "daily", "weekly", "monthly":
@@ -701,9 +1070,16 @@ func isValidMode(m string) bool {
 	}
 }
 
-func mustValidUUID(s string) {
+func validateUUID(s string) error {
 	if !uuidRe.MatchString(s) {
-		fatalf("invalid UUID: %s", s)
+		return fmt.Errorf("invalid UUID: %s", s)
+	}
+	return nil
+}
+
+func mustValidUUID(s string) {
+	if err := validateUUID(s); err != nil {
+		fatalf("%v", err)
 	}
 }
 

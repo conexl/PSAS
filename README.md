@@ -83,6 +83,7 @@ sudo install -m 0755 psasctl /usr/local/bin/psasctl
 psasctl status
 psasctl status --json
 psasctl admin-url
+psasctl ui
 
 psasctl users list
 psasctl users list --enabled
@@ -108,6 +109,10 @@ psasctl apply
 ```bash
 psasctl u list
 ```
+
+Интерактивный режим:
+- `psasctl ui` (или `psasctl menu`) открывает текстовое меню в терминале.
+- Все флаговые команды продолжают работать как раньше.
 
 Переменные окружения:
 - `PSAS_PANEL_CFG` (default `/opt/hiddify-manager/hiddify-panel/app.cfg`)
