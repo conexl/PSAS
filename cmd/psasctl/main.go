@@ -426,7 +426,7 @@ func runUI(args []string) {
 		}
 
 		clearScreen()
-		fmt.Printf("=== %s ===\n\n", choice.Title)
+		printBoxedHeader(choice.Title)
 
 		var actionErr error
 		switch choice.Key {
@@ -454,9 +454,9 @@ func runUI(args []string) {
 
 		if actionErr != nil {
 			if errors.Is(actionErr, errUISelectionCanceled) {
-				fmt.Println("Canceled.")
+				printInfo("Canceled.")
 			} else {
-				fmt.Printf("Error: %v\n", actionErr)
+				printError(fmt.Sprintf("%v", actionErr))
 			}
 		}
 		must(uiPause(in))
@@ -493,6 +493,40 @@ type uiMenuInput struct {
 
 type terminalState struct {
 	sttyMode string
+}
+
+// Improved UI drawing functions
+func printBoxedHeader(title string) {
+	width := len(title) + 4
+	if width < 40 {
+		width = 40
+	}
+	
+	fmt.Println(strings.Repeat("═", width))
+	padding := (width - len(title) - 2) / 2
+	fmt.Printf("║%s%s%s║\n", strings.Repeat(" ", padding), title, strings.Repeat(" ", width-padding-len(title)-2))
+	fmt.Println(strings.Repeat("═", width))
+	fmt.Println()
+}
+
+func printSectionHeader(title string) {
+	fmt.Printf("\n┌─ %s ─┐\n", title)
+}
+
+func printInfo(msg string) {
+	fmt.Printf("ℹ  %s\n", msg)
+}
+
+func printSuccess(msg string) {
+	fmt.Printf("✓  %s\n", msg)
+}
+
+func printError(msg string) {
+	fmt.Printf("✗  %s\n", msg)
+}
+
+func printSeparator() {
+	fmt.Println(strings.Repeat("─", 60))
 }
 
 func uiSelectMenuItem(items []uiMenuItem, in *bufio.Reader) (uiMenuItem, error) {
@@ -569,20 +603,22 @@ func uiSelectMenuItem(items []uiMenuItem, in *bufio.Reader) (uiMenuItem, error) 
 
 func uiSelectMenuItemFallback(items []uiMenuItem, in *bufio.Reader) (uiMenuItem, error) {
 	clearScreen()
-	fmt.Println("psasctl interactive menu")
-	fmt.Println("Arrow-mode is unavailable in this terminal; fallback to number input.")
+	printBoxedHeader("psasctl interactive menu")
+	printInfo("Arrow-mode is unavailable in this terminal; fallback to number input.")
 	fmt.Println()
+	
 	for i, item := range items {
-		fmt.Printf("  %d) %s\n", i+1, item.Title)
+		fmt.Printf("  %d. %s\n", i+1, item.Title)
 	}
+	
 	for {
-		raw, err := promptRequiredLine(in, "Choose option number")
+		raw, err := promptRequiredLine(in, "\nChoose option number")
 		if err != nil {
 			return uiMenuItem{}, err
 		}
 		n, err := strconv.Atoi(strings.TrimSpace(raw))
 		if err != nil || n < 1 || n > len(items) {
-			fmt.Printf("Invalid option. Enter number 1-%d.\n", len(items))
+			printError(fmt.Sprintf("Invalid option. Enter number 1-%d.", len(items)))
 			continue
 		}
 		return items[n-1], nil
@@ -591,24 +627,47 @@ func uiSelectMenuItemFallback(items []uiMenuItem, in *bufio.Reader) (uiMenuItem,
 
 func drawUIMenu(items []uiMenuItem, selected int) {
 	clearScreen()
-	fmt.Println("psasctl interactive console")
-	fmt.Println("Navigate with Arrow Up/Down (or j/k), Enter to select, q to exit.")
-	fmt.Println("Quick select: number 1-9 or shortcut key in brackets.")
+	
+	// Header
+	printBoxedHeader("psasctl interactive console")
+	
+	// Instructions
+	fmt.Println("┌─ Navigation ───────────────────────────────────────────┐")
+	fmt.Println("│ ↑/↓ or j/k : Navigate    Enter : Select    q : Exit   │")
+	fmt.Println("│ 1-9        : Quick jump  Shortcut keys in [brackets]  │")
+	fmt.Println("└────────────────────────────────────────────────────────┘")
 	fmt.Println()
+	
+	// Menu items with better alignment
+	maxTitleLen := 0
+	for _, item := range items {
+		if len(item.Title) > maxTitleLen {
+			maxTitleLen = len(item.Title)
+		}
+	}
+	
 	for i, item := range items {
 		cursor := "  "
 		if i == selected {
-			cursor = "> "
+			cursor = "► "
 		}
-		hotkey := ""
+		
+		hotkey := " "
 		if item.Shortcut != 0 {
-			hotkey = fmt.Sprintf(" [%c]", unicode.ToLower(item.Shortcut))
+			hotkey = fmt.Sprintf("[%c]", unicode.ToLower(item.Shortcut))
 		}
-		fmt.Printf("%s%d) %s%s\n", cursor, i+1, item.Title, hotkey)
+		
+		// Align everything nicely
+		titlePadded := item.Title + strings.Repeat(" ", maxTitleLen-len(item.Title))
+		fmt.Printf("%s%d. %s %s\n", cursor, i+1, titlePadded, hotkey)
 	}
+	
+	// Hint section
 	if selected >= 0 && selected < len(items) && items[selected].Hint != "" {
 		fmt.Println()
-		fmt.Printf("Hint: %s\n", items[selected].Hint)
+		fmt.Println("┌─ Hint ─────────────────────────────────────────────────┐")
+		fmt.Printf("│ %s%s │\n", items[selected].Hint, strings.Repeat(" ", max(0, 55-len(items[selected].Hint))))
+		fmt.Println("└────────────────────────────────────────────────────────┘")
 	}
 }
 
@@ -713,7 +772,9 @@ func clearScreen() {
 }
 
 func uiPause(in *bufio.Reader) error {
-	fmt.Print("\nPress Enter to return to menu...")
+	fmt.Print("\n")
+	printSeparator()
+	fmt.Print("Press Enter to return to menu...")
 	_, err := in.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return err
@@ -749,7 +810,8 @@ func uiRunFlagWizard(c *client, in *bufio.Reader) error {
 		return errUISelectionCanceled
 	}
 
-	fmt.Printf("Command: psasctl %s\n", quoteCommandArgs(args))
+	fmt.Printf("\n")
+	printInfo(fmt.Sprintf("Command: psasctl %s", quoteCommandArgs(args)))
 	runNow, err := promptYesNo(in, "Run this command?", true)
 	if err != nil {
 		return err
@@ -962,7 +1024,7 @@ func promptUUIDOptionalValue(in *bufio.Reader, label string) (string, error) {
 			return "", nil
 		}
 		if err := validateUUID(id); err != nil {
-			fmt.Println(err)
+			printError(err.Error())
 			continue
 		}
 		return strings.ToLower(id), nil
@@ -1109,16 +1171,18 @@ func uiSelectOptionValue(title string, options []uiOption, defaultIdx int, in *b
 
 func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx int, in *bufio.Reader) (string, error) {
 	clearScreen()
-	fmt.Println(title)
-	fmt.Println("Arrow-mode is unavailable; choose by number.")
+	printBoxedHeader(title)
+	printInfo("Arrow-mode is unavailable; choose by number.")
 	fmt.Println()
+	
 	for i, opt := range options {
-		fmt.Printf("  %d) %s\n", i+1, opt.Title)
+		fmt.Printf("  %d. %s\n", i+1, opt.Title)
 	}
-	fmt.Println("  q) Cancel")
+	fmt.Println("  q. Cancel")
+	
 	def := strconv.Itoa(defaultIdx + 1)
 	for {
-		raw, err := promptLine(in, "Choose option number", def)
+		raw, err := promptLine(in, "\nChoose option number", def)
 		if err != nil {
 			return "", err
 		}
@@ -1128,7 +1192,7 @@ func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx in
 		}
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 || n > len(options) {
-			fmt.Printf("Invalid option. Enter number 1-%d or q.\n", len(options))
+			printError(fmt.Sprintf("Invalid option. Enter number 1-%d or q.", len(options)))
 			continue
 		}
 		return options[n-1].Value, nil
@@ -1137,19 +1201,35 @@ func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx in
 
 func drawUIOptionsMenu(title string, options []uiOption, selected int) {
 	clearScreen()
-	fmt.Println(title)
-	fmt.Println("Use Arrow Up/Down (or j/k), Enter to select, q to cancel.")
+	printBoxedHeader(title)
+	
+	fmt.Println("┌─ Navigation ───────────────────────────────────────────┐")
+	fmt.Println("│ ↑/↓ or j/k : Navigate    Enter : Select    q : Cancel │")
+	fmt.Println("└────────────────────────────────────────────────────────┘")
 	fmt.Println()
+	
+	// Calculate max title length for alignment
+	maxLen := 0
+	for _, opt := range options {
+		if len(opt.Title) > maxLen {
+			maxLen = len(opt.Title)
+		}
+	}
+	
 	for i, opt := range options {
 		cursor := "  "
 		if i == selected {
-			cursor = "> "
+			cursor = "► "
 		}
-		fmt.Printf("%s%d) %s\n", cursor, i+1, opt.Title)
+		titlePadded := opt.Title + strings.Repeat(" ", maxLen-len(opt.Title))
+		fmt.Printf("%s%d. %s\n", cursor, i+1, titlePadded)
 	}
+	
 	if selected >= 0 && selected < len(options) && options[selected].Hint != "" {
 		fmt.Println()
-		fmt.Printf("Hint: %s\n", options[selected].Hint)
+		fmt.Println("┌─ Hint ─────────────────────────────────────────────────┐")
+		fmt.Printf("│ %s%s │\n", options[selected].Hint, strings.Repeat(" ", max(0, 55-len(options[selected].Hint))))
+		fmt.Println("└────────────────────────────────────────────────────────┘")
 	}
 }
 
@@ -1268,20 +1348,22 @@ func uiSelectUser(users []apiUser, title string, in *bufio.Reader) (apiUser, err
 
 func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiUser, error) {
 	clearScreen()
-	fmt.Println(title)
-	fmt.Println("Arrow-mode is unavailable; choose by number.")
+	printBoxedHeader(title)
+	printInfo("Arrow-mode is unavailable; choose by number.")
 	fmt.Println()
+	
 	for i, u := range users {
-		state := "off"
+		state := "disabled"
 		if u.Enable {
-			state = "on"
+			state = "enabled "
 		}
-		fmt.Printf("  %d) %s (%s) [%s]\n", i+1, u.Name, u.UUID, state)
+		fmt.Printf("  %d. %-20s %s [%s]\n", i+1, shortText(u.Name, 20), u.UUID, state)
 	}
-	fmt.Println("  0) Manual USER_ID input")
-	fmt.Println("  q) Cancel")
+	fmt.Println("  0. Manual USER_ID input")
+	fmt.Println("  q. Cancel")
+	
 	for {
-		raw, err := promptRequiredLine(in, "Choose user number")
+		raw, err := promptRequiredLine(in, "\nChoose user number")
 		if err != nil {
 			return apiUser{}, err
 		}
@@ -1291,7 +1373,7 @@ func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiU
 		}
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 0 || n > len(users) {
-			fmt.Printf("Invalid option. Enter number 0-%d or q.\n", len(users))
+			printError(fmt.Sprintf("Invalid option. Enter number 0-%d or q.", len(users)))
 			continue
 		}
 		if n == 0 {
@@ -1303,16 +1385,22 @@ func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiU
 
 func drawUIUserPicker(title string, users, filtered []apiUser, selected int, query string) {
 	clearScreen()
-	fmt.Println(title)
-	fmt.Println("Use Arrow Up/Down to pick, Enter to select, type to filter, Backspace to erase.")
-	fmt.Println("Press i for manual USER_ID input, q to cancel.")
+	printBoxedHeader(title)
+	
+	fmt.Println("┌─ Navigation ───────────────────────────────────────────┐")
+	fmt.Println("│ ↑/↓      : Navigate         Enter : Select            │")
+	fmt.Println("│ Type     : Filter           Backspace : Erase         │")
+	fmt.Println("│ i        : Manual input     q : Cancel                │")
+	fmt.Println("└────────────────────────────────────────────────────────┘")
 	fmt.Println()
+	
+	// Filter status
 	fmt.Printf("Filter: %s\n", query)
 	fmt.Printf("Matches: %d/%d\n", len(filtered), len(users))
-	fmt.Println()
+	printSeparator()
 
 	if len(filtered) == 0 {
-		fmt.Println("No users match current filter.")
+		printInfo("No users match current filter.")
 		return
 	}
 
@@ -1329,22 +1417,28 @@ func drawUIUserPicker(title string, users, filtered []apiUser, selected int, que
 	}
 	end := min(len(filtered), start+pageSize)
 
+	// Table header
+	fmt.Printf("  %-20s %-36s %s\n", "NAME", "UUID", "STATUS")
+	printSeparator()
+	
 	for i := start; i < end; i++ {
 		u := filtered[i]
 		cursor := "  "
 		if i == selected {
-			cursor = "> "
+			cursor = "► "
 		}
-		state := "off"
+		state := "disabled"
 		if u.Enable {
-			state = "on "
+			state = "enabled "
 		}
-		fmt.Printf("%s%-18s %-36s [%s]\n", cursor, shortText(u.Name, 18), u.UUID, state)
+		
+		nameTrunc := shortText(u.Name, 20)
+		fmt.Printf("%s%-20s %-36s %s\n", cursor, nameTrunc, u.UUID, state)
 	}
 
 	if end < len(filtered) {
 		fmt.Println()
-		fmt.Printf("Showing %d-%d of %d matches\n", start+1, end, len(filtered))
+		printInfo(fmt.Sprintf("Showing %d-%d of %d matches", start+1, end, len(filtered)))
 	}
 }
 
@@ -1379,14 +1473,15 @@ func uiStatus(c *client) error {
 	cfg := c.currentConfig()
 	mainDomain := c.mainDomain()
 
-	fmt.Printf("Main domain: %s\n", mainDomain)
-	fmt.Printf("Admin URL: %s\n", c.adminURL(mainDomain))
-	fmt.Printf("Client path: %v\n", cfg["proxy_path_client"])
-	fmt.Printf("Reality enabled: %v\n", cfg["reality_enable"])
-	fmt.Printf("Hysteria2 enabled: %v\n", cfg["hysteria_enable"])
-	fmt.Printf("Hysteria base port: %v\n", cfg["hysteria_port"])
-	fmt.Printf("Reality SNI: %v\n", cfg["reality_server_names"])
-	fmt.Printf("Users: %d\n", len(c.state.Users))
+	printSectionHeader("System Status")
+	fmt.Printf("  Main domain        : %s\n", mainDomain)
+	fmt.Printf("  Admin URL          : %s\n", c.adminURL(mainDomain))
+	fmt.Printf("  Client path        : %v\n", cfg["proxy_path_client"])
+	fmt.Printf("  Reality enabled    : %v\n", cfg["reality_enable"])
+	fmt.Printf("  Hysteria2 enabled  : %v\n", cfg["hysteria_enable"])
+	fmt.Printf("  Hysteria base port : %v\n", cfg["hysteria_port"])
+	fmt.Printf("  Reality SNI        : %v\n", cfg["reality_server_names"])
+	fmt.Printf("  Users              : %d\n", len(c.state.Users))
 	return nil
 }
 
@@ -1420,7 +1515,7 @@ func uiFindUsers(c *client, in *bufio.Reader) error {
 	}
 	users = filterUsers(users, query, isYes(enabledRaw))
 	if len(users) == 0 {
-		fmt.Println("No users found.")
+		printInfo("No users found.")
 		return nil
 	}
 	printUsers(users)
@@ -1448,6 +1543,7 @@ func uiShowUser(c *client, in *bufio.Reader) error {
 	}
 	links := buildLinks(c.clientPath(), u.UUID, host)
 	printUser(u)
+	fmt.Println()
 	printLinksFromSet(links)
 	return nil
 }
@@ -1507,7 +1603,7 @@ func uiAddUser(c *client, in *bufio.Reader) error {
 		return err
 	}
 	links := buildLinks(c.clientPath(), u.UUID, host)
-	fmt.Println("User created.")
+	printSuccess("User created.")
 	printLinksFromSet(links)
 	return nil
 }
@@ -1521,19 +1617,20 @@ func uiDeleteUser(c *client, in *bufio.Reader) error {
 		return err
 	}
 
-	fmt.Printf("About to delete: %s (%s)\n", u.UUID, u.Name)
+	fmt.Printf("\n")
+	printInfo(fmt.Sprintf("About to delete: %s (%s)", u.UUID, u.Name))
 	confirm, err := promptLine(in, "Confirm delete? (yes/no)", "no")
 	if err != nil {
 		return err
 	}
 	if !isYes(confirm) {
-		fmt.Println("Canceled.")
+		printInfo("Canceled.")
 		return nil
 	}
 	if err := c.userDelete(u.UUID); err != nil {
 		return err
 	}
-	fmt.Printf("Deleted: %s (%s)\n", u.UUID, u.Name)
+	printSuccess(fmt.Sprintf("Deleted: %s (%s)", u.UUID, u.Name))
 	return nil
 }
 
@@ -1833,12 +1930,13 @@ func filterUsers(users []apiUser, nameFilter string, enabledOnly bool) []apiUser
 }
 
 func printUser(u apiUser) {
-	fmt.Printf("UUID: %s\n", u.UUID)
-	fmt.Printf("Name: %s\n", u.Name)
-	fmt.Printf("Enabled: %t\n", u.Enable)
-	fmt.Printf("Limit GB: %.2f\n", u.UsageLimitGB)
-	fmt.Printf("Days: %d\n", u.PackageDays)
-	fmt.Printf("Mode: %s\n", u.Mode)
+	printSectionHeader("User Details")
+	fmt.Printf("  UUID       : %s\n", u.UUID)
+	fmt.Printf("  Name       : %s\n", u.Name)
+	fmt.Printf("  Enabled    : %t\n", u.Enable)
+	fmt.Printf("  Limit GB   : %.2f\n", u.UsageLimitGB)
+	fmt.Printf("  Days       : %d\n", u.PackageDays)
+	fmt.Printf("  Mode       : %s\n", u.Mode)
 }
 
 func buildLinks(clientPath, uuid, host string) linkSet {
@@ -1855,12 +1953,13 @@ func buildLinks(clientPath, uuid, host string) linkSet {
 }
 
 func printLinksFromSet(l linkSet) {
-	fmt.Printf("User UUID: %s\n", l.UUID)
-	fmt.Printf("Panel URL: %s\n", l.Panel)
-	fmt.Printf("Hiddify (auto): %s\n", l.Auto)
-	fmt.Printf("Subscription b64: %s\n", l.Sub64)
-	fmt.Printf("Subscription plain: %s\n", l.Sub)
-	fmt.Printf("Sing-box: %s\n", l.Singbox)
+	printSectionHeader("Access Links")
+	fmt.Printf("  User UUID          : %s\n", l.UUID)
+	fmt.Printf("  Panel URL          : %s\n", l.Panel)
+	fmt.Printf("  Hiddify (auto)     : %s\n", l.Auto)
+	fmt.Printf("  Subscription b64   : %s\n", l.Sub64)
+	fmt.Printf("  Subscription plain : %s\n", l.Sub)
+	fmt.Printf("  Sing-box           : %s\n", l.Singbox)
 }
 
 func formatUserRefs(users []apiUser) string {
@@ -1913,19 +2012,26 @@ func stripANSI(b []byte) []byte {
 	return []byte(s)
 }
 
-func shortText(s string, max int) string {
+func shortText(s string, maxLen int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= max {
+	if len(s) <= maxLen {
 		return s
 	}
-	if max < 4 {
-		return s[:max]
+	if maxLen < 4 {
+		return s[:maxLen]
 	}
-	return s[:max-3] + "..."
+	return s[:maxLen-3] + "..."
 }
 
 func min(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
@@ -1965,7 +2071,7 @@ func promptRequiredLine(in *bufio.Reader, label string) (string, error) {
 		if strings.TrimSpace(s) != "" {
 			return s, nil
 		}
-		fmt.Println("Value is required.")
+		printError("Value is required.")
 	}
 }
 
@@ -1978,7 +2084,7 @@ func promptPositiveIntValue(in *bufio.Reader, label string, def int) (int, error
 		}
 		v, err := parsePositiveInt(raw)
 		if err != nil {
-			fmt.Printf("Invalid value: %v\n", err)
+			printError(fmt.Sprintf("Invalid value: %v", err))
 			continue
 		}
 		return v, nil
@@ -1994,7 +2100,7 @@ func promptPositiveFloatValue(in *bufio.Reader, label string, def float64) (floa
 		}
 		v, err := parsePositiveFloat(raw)
 		if err != nil {
-			fmt.Printf("Invalid value: %v\n", err)
+			printError(fmt.Sprintf("Invalid value: %v", err))
 			continue
 		}
 		return v, nil
@@ -2012,7 +2118,7 @@ func promptUUIDOrAuto(in *bufio.Reader, label string) (string, error) {
 			return newUUID(), nil
 		}
 		if err := validateUUID(id); err != nil {
-			fmt.Println(err)
+			printError(err.Error())
 			continue
 		}
 		return strings.ToLower(id), nil
