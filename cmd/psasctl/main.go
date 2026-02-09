@@ -68,6 +68,7 @@ type client struct {
 }
 
 var uuidRe = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
+var ansiRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -694,8 +695,12 @@ func (c *client) loadState() error {
 	if err != nil {
 		return err
 	}
+	jsonOut, err := extractJSONObject(out)
+	if err != nil {
+		return fmt.Errorf("parse all-configs: %w; output=%q", err, shortText(string(stripANSI(out)), 240))
+	}
 	var st state
-	if err := json.Unmarshal(out, &st); err != nil {
+	if err := json.Unmarshal(jsonOut, &st); err != nil {
 		return fmt.Errorf("parse all-configs: %w", err)
 	}
 	if st.APIPath == "" || st.APIKey == "" {
@@ -709,9 +714,22 @@ func (c *client) runPanel(args ...string) ([]byte, error) {
 	cmdArgs := append([]string{"-m", "hiddifypanel"}, args...)
 	cmd := exec.Command(c.panelPy, cmdArgs...)
 	cmd.Env = append(os.Environ(), "HIDDIFY_CFG_PATH="+c.panelCfg)
-	out, err := cmd.CombinedOutput()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	out := bytes.TrimSpace(stdout.Bytes())
 	if err != nil {
-		return nil, fmt.Errorf("panel cli failed: %w\n%s", err, string(out))
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(stdout.String())
+		}
+		return nil, fmt.Errorf("panel cli failed: %w\n%s", err, msg)
+	}
+	if len(out) == 0 {
+		// Some panel builds may print to stderr on success.
+		out = bytes.TrimSpace(stderr.Bytes())
 	}
 	return out, nil
 }
@@ -983,6 +1001,43 @@ func printJSON(v any) {
 	b, err := json.MarshalIndent(v, "", "  ")
 	must(err)
 	fmt.Println(string(b))
+}
+
+func extractJSONObject(raw []byte) ([]byte, error) {
+	cleaned := bytes.TrimSpace(stripANSI(raw))
+	if len(cleaned) == 0 {
+		return nil, errors.New("empty output")
+	}
+	if json.Valid(cleaned) {
+		return cleaned, nil
+	}
+	start := bytes.IndexByte(cleaned, '{')
+	end := bytes.LastIndexByte(cleaned, '}')
+	if start == -1 || end == -1 || end < start {
+		return nil, errors.New("json object not found in output")
+	}
+	payload := bytes.TrimSpace(cleaned[start : end+1])
+	if !json.Valid(payload) {
+		return nil, errors.New("json object is invalid")
+	}
+	return payload, nil
+}
+
+func stripANSI(b []byte) []byte {
+	s := ansiRe.ReplaceAllString(string(b), "")
+	s = strings.ReplaceAll(s, "\r", "")
+	return []byte(s)
+}
+
+func shortText(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	if max < 4 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
 }
 
 func min(a, b int) int {
