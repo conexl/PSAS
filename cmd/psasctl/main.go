@@ -497,36 +497,32 @@ type terminalState struct {
 
 // Improved UI drawing functions
 func printBoxedHeader(title string) {
-	width := len(title) + 4
-	if width < 40 {
-		width = 40
-	}
-	
-	fmt.Println(strings.Repeat("═", width))
-	padding := (width - len(title) - 2) / 2
-	fmt.Printf("║%s%s%s║\n", strings.Repeat(" ", padding), title, strings.Repeat(" ", width-padding-len(title)-2))
-	fmt.Println(strings.Repeat("═", width))
+	const width = 70
+	fmt.Println(strings.Repeat("=", width))
+	padding := (width - len(title)) / 2
+	fmt.Printf("%s%s\n", strings.Repeat(" ", padding), title)
+	fmt.Println(strings.Repeat("=", width))
 	fmt.Println()
 }
 
 func printSectionHeader(title string) {
-	fmt.Printf("\n┌─ %s ─┐\n", title)
+	fmt.Printf("\n--- %s ---\n", title)
 }
 
 func printInfo(msg string) {
-	fmt.Printf("ℹ  %s\n", msg)
+	fmt.Printf("[i] %s\n", msg)
 }
 
 func printSuccess(msg string) {
-	fmt.Printf("✓  %s\n", msg)
+	fmt.Printf("[+] %s\n", msg)
 }
 
 func printError(msg string) {
-	fmt.Printf("✗  %s\n", msg)
+	fmt.Printf("[!] %s\n", msg)
 }
 
 func printSeparator() {
-	fmt.Println(strings.Repeat("─", 60))
+	fmt.Println(strings.Repeat("-", 70))
 }
 
 func uiSelectMenuItem(items []uiMenuItem, in *bufio.Reader) (uiMenuItem, error) {
@@ -631,43 +627,39 @@ func drawUIMenu(items []uiMenuItem, selected int) {
 	// Header
 	printBoxedHeader("psasctl interactive console")
 	
-	// Instructions
-	fmt.Println("┌─ Navigation ───────────────────────────────────────────┐")
-	fmt.Println("│ ↑/↓ or j/k : Navigate    Enter : Select    q : Exit   │")
-	fmt.Println("│ 1-9        : Quick jump  Shortcut keys in [brackets]  │")
-	fmt.Println("└────────────────────────────────────────────────────────┘")
+	// Instructions - fixed width
+	fmt.Println("+--------------------------------------------------------------------+")
+	fmt.Println("| Navigation: Up/Down or j/k  |  Enter: Select  |  q: Exit           |")
+	fmt.Println("| Quick jump: 1-9             |  Shortcut keys in [brackets]         |")
+	fmt.Println("+--------------------------------------------------------------------+")
 	fmt.Println()
 	
-	// Menu items with better alignment
-	maxTitleLen := 0
-	for _, item := range items {
-		if len(item.Title) > maxTitleLen {
-			maxTitleLen = len(item.Title)
-		}
-	}
-	
+	// Menu items with fixed width
 	for i, item := range items {
 		cursor := "  "
 		if i == selected {
-			cursor = "► "
+			cursor = "> "
 		}
 		
-		hotkey := " "
+		hotkey := "   "
 		if item.Shortcut != 0 {
 			hotkey = fmt.Sprintf("[%c]", unicode.ToLower(item.Shortcut))
 		}
 		
-		// Align everything nicely
-		titlePadded := item.Title + strings.Repeat(" ", maxTitleLen-len(item.Title))
-		fmt.Printf("%s%d. %s %s\n", cursor, i+1, titlePadded, hotkey)
+		// Fixed format: cursor + number + title (padded to 30) + hotkey
+		titlePadded := item.Title
+		if len(titlePadded) > 28 {
+			titlePadded = titlePadded[:28]
+		}
+		fmt.Printf("%s%d. %-30s %s\n", cursor, i+1, titlePadded, hotkey)
 	}
 	
 	// Hint section
 	if selected >= 0 && selected < len(items) && items[selected].Hint != "" {
 		fmt.Println()
-		fmt.Println("┌─ Hint ─────────────────────────────────────────────────┐")
-		fmt.Printf("│ %s%s │\n", items[selected].Hint, strings.Repeat(" ", max(0, 55-len(items[selected].Hint))))
-		fmt.Println("└────────────────────────────────────────────────────────┘")
+		fmt.Println("+--------------------------------------------------------------------+")
+		fmt.Printf("| Hint: %-62s |\n", items[selected].Hint)
+		fmt.Println("+--------------------------------------------------------------------+")
 	}
 }
 
@@ -1203,33 +1195,24 @@ func drawUIOptionsMenu(title string, options []uiOption, selected int) {
 	clearScreen()
 	printBoxedHeader(title)
 	
-	fmt.Println("┌─ Navigation ───────────────────────────────────────────┐")
-	fmt.Println("│ ↑/↓ or j/k : Navigate    Enter : Select    q : Cancel │")
-	fmt.Println("└────────────────────────────────────────────────────────┘")
+	fmt.Println("+--------------------------------------------------------------------+")
+	fmt.Println("| Navigation: Up/Down or j/k  |  Enter: Select  |  q: Cancel         |")
+	fmt.Println("+--------------------------------------------------------------------+")
 	fmt.Println()
-	
-	// Calculate max title length for alignment
-	maxLen := 0
-	for _, opt := range options {
-		if len(opt.Title) > maxLen {
-			maxLen = len(opt.Title)
-		}
-	}
 	
 	for i, opt := range options {
 		cursor := "  "
 		if i == selected {
-			cursor = "► "
+			cursor = "> "
 		}
-		titlePadded := opt.Title + strings.Repeat(" ", maxLen-len(opt.Title))
-		fmt.Printf("%s%d. %s\n", cursor, i+1, titlePadded)
+		fmt.Printf("%s%d. %-30s\n", cursor, i+1, opt.Title)
 	}
 	
 	if selected >= 0 && selected < len(options) && options[selected].Hint != "" {
 		fmt.Println()
-		fmt.Println("┌─ Hint ─────────────────────────────────────────────────┐")
-		fmt.Printf("│ %s%s │\n", options[selected].Hint, strings.Repeat(" ", max(0, 55-len(options[selected].Hint))))
-		fmt.Println("└────────────────────────────────────────────────────────┘")
+		fmt.Println("+--------------------------------------------------------------------+")
+		fmt.Printf("| Hint: %-62s |\n", options[selected].Hint)
+		fmt.Println("+--------------------------------------------------------------------+")
 	}
 }
 
@@ -1387,11 +1370,10 @@ func drawUIUserPicker(title string, users, filtered []apiUser, selected int, que
 	clearScreen()
 	printBoxedHeader(title)
 	
-	fmt.Println("┌─ Navigation ───────────────────────────────────────────┐")
-	fmt.Println("│ ↑/↓      : Navigate         Enter : Select            │")
-	fmt.Println("│ Type     : Filter           Backspace : Erase         │")
-	fmt.Println("│ i        : Manual input     q : Cancel                │")
-	fmt.Println("└────────────────────────────────────────────────────────┘")
+	fmt.Println("+--------------------------------------------------------------------+")
+	fmt.Println("| Navigation: Up/Down  |  Enter: Select  |  Type: Filter           |")
+	fmt.Println("| Backspace: Erase     |  i: Manual input  |  q: Cancel            |")
+	fmt.Println("+--------------------------------------------------------------------+")
 	fmt.Println()
 	
 	// Filter status
@@ -1418,14 +1400,14 @@ func drawUIUserPicker(title string, users, filtered []apiUser, selected int, que
 	end := min(len(filtered), start+pageSize)
 
 	// Table header
-	fmt.Printf("  %-20s %-36s %s\n", "NAME", "UUID", "STATUS")
+	fmt.Printf("  %-20s %-38s %s\n", "NAME", "UUID", "STATUS")
 	printSeparator()
 	
 	for i := start; i < end; i++ {
 		u := filtered[i]
 		cursor := "  "
 		if i == selected {
-			cursor = "► "
+			cursor = "> "
 		}
 		state := "disabled"
 		if u.Enable {
@@ -1433,7 +1415,7 @@ func drawUIUserPicker(title string, users, filtered []apiUser, selected int, que
 		}
 		
 		nameTrunc := shortText(u.Name, 20)
-		fmt.Printf("%s%-20s %-36s %s\n", cursor, nameTrunc, u.UUID, state)
+		fmt.Printf("%s%-20s %-38s %s\n", cursor, nameTrunc, u.UUID, state)
 	}
 
 	if end < len(filtered) {
