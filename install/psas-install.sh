@@ -182,6 +182,8 @@ else
   PANEL_PY="python3"
 fi
 PANEL_ADDR="http://127.0.0.1:9000"
+UNLIMITED_PACKAGE_DAYS=10000
+UNLIMITED_USAGE_GB=1000000
 
 require_bin() {
   command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }
@@ -189,14 +191,14 @@ require_bin() {
 require_bin jq
 require_bin curl
 require_bin uuidgen
+require_bin awk
 
 load_state() {
-  local json
-  json="$(HIDDIFY_CFG_PATH="$PANEL_CFG_PATH" "$PANEL_PY" -m hiddifypanel all-configs 2>/dev/null)"
-  API_PATH="$(jq -r '.api_path' <<<"$json")"
-  API_KEY="$(jq -r '.api_key' <<<"$json")"
-  CLIENT_PATH="$(jq -r '.chconfigs["0"].proxy_path_client' <<<"$json")"
-  MAIN_DOMAIN="$(jq -r '[.domains[] | select(.mode=="direct" and (.domain|test("^[0-9.]+$")|not)) | .domain][0] // [.domains[] | select(.mode=="direct") | .domain][0] // empty' <<<"$json")"
+  STATE_JSON="$(HIDDIFY_CFG_PATH="$PANEL_CFG_PATH" "$PANEL_PY" -m hiddifypanel all-configs 2>/dev/null)"
+  API_PATH="$(jq -r '.api_path // empty' <<<"$STATE_JSON")"
+  API_KEY="$(jq -r '.api_key // empty' <<<"$STATE_JSON")"
+  CLIENT_PATH="$(jq -r '.chconfigs["0"].proxy_path_client // empty' <<<"$STATE_JSON")"
+  MAIN_DOMAIN="$(jq -r '[.domains[] | select(.mode=="direct" and (.domain|test("^[0-9.]+$")|not)) | .domain][0] // [.domains[] | select(.mode=="direct") | .domain][0] // empty' <<<"$STATE_JSON")"
   if [[ -z "$API_PATH" || -z "$API_KEY" || -z "$CLIENT_PATH" || -z "$MAIN_DOMAIN" ]]; then
     echo "Unable to read Hiddify state" >&2
     exit 1
@@ -211,6 +213,326 @@ api() {
     curl -fsS -X "$method" -H "Hiddify-API-Key: $API_KEY" -H "Content-Type: application/json" "$PANEL_ADDR/$API_PATH/api/v2/admin/$path" -d "$data"
   else
     curl -fsS -X "$method" -H "Hiddify-API-Key: $API_KEY" "$PANEL_ADDR/$API_PATH/api/v2/admin/$path"
+  fi
+}
+
+run_panel() {
+  HIDDIFY_CFG_PATH="$PANEL_CFG_PATH" "$PANEL_PY" -m hiddifypanel "$@"
+}
+
+set_setting() {
+  run_panel set-setting -k "$1" -v "$2" >/dev/null
+}
+
+apply_config() {
+  if [[ -x /usr/local/bin/hiddify-apply-safe ]]; then
+    /usr/local/bin/hiddify-apply-safe "$MAIN_DOMAIN"
+    return
+  fi
+  if [[ -x /opt/hiddify-manager/common/commander.py ]]; then
+    /opt/hiddify-manager/common/commander.py apply
+    return
+  fi
+  echo "Unable to apply config automatically" >&2
+  exit 1
+}
+
+trim() {
+  local s="${1:-}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+is_uuid() {
+  [[ "${1:-}" =~ ^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$ ]]
+}
+
+is_positive_int() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && (( "$1" > 0 ))
+}
+
+is_positive_number() {
+  awk -v n="${1:-}" 'BEGIN{if ((n+0) > 0) exit 0; exit 1}' >/dev/null 2>&1
+}
+
+normalize_token() {
+  local x
+  x="$(tr '[:upper:]' '[:lower:]' <<<"${1:-}")"
+  x="${x// /}"
+  x="${x//_/-}"
+  printf '%s' "$x"
+}
+
+resolve_name_value() {
+  local name subscription_name required
+  name="$(trim "${1:-}")"
+  subscription_name="$(trim "${2:-}")"
+  required="${3:-no}"
+
+  if [[ -n "$subscription_name" ]]; then
+    if [[ -n "$name" && "$name" != "$subscription_name" ]]; then
+      echo "--name and --subscription-name must be the same when both are provided" >&2
+      return 1
+    fi
+    name="$subscription_name"
+  fi
+
+  if [[ "$required" == "yes" && -z "$name" ]]; then
+    echo "--name is required" >&2
+    return 1
+  fi
+  printf '%s' "$name"
+}
+
+resolve_user_uuid() {
+  local key users_json key_lc exact_count partial_count refs
+  key="$(trim "${1:-}")"
+  [[ -n "$key" ]] || { echo "USER_ID is required" >&2; exit 1; }
+
+  if is_uuid "$key"; then
+    key="$(tr 'A-Z' 'a-z' <<<"$key")"
+    api GET "user/$key/" >/dev/null
+    printf '%s' "$key"
+    return 0
+  fi
+
+  users_json="$(api GET "user/")"
+  key_lc="$(tr '[:upper:]' '[:lower:]' <<<"$key")"
+
+  exact_count="$(jq -r --arg q "$key_lc" '[.[] | select((.name // "" | ascii_downcase) == $q)] | length' <<<"$users_json")"
+  if [[ "$exact_count" == "1" ]]; then
+    jq -r --arg q "$key_lc" '.[] | select((.name // "" | ascii_downcase) == $q) | .uuid' <<<"$users_json"
+    return 0
+  fi
+  if [[ "$exact_count" != "0" ]]; then
+    refs="$(jq -r --arg q "$key_lc" '.[] | select((.name // "" | ascii_downcase) == $q) | "\(.name)(\(.uuid))"' <<<"$users_json" | paste -sd ', ' -)"
+    echo "Multiple users have name \"$key\": ${refs}" >&2
+    exit 1
+  fi
+
+  partial_count="$(jq -r --arg q "$key_lc" '[.[] | select((.name // "" | ascii_downcase | contains($q)))] | length' <<<"$users_json")"
+  if [[ "$partial_count" == "1" ]]; then
+    jq -r --arg q "$key_lc" '.[] | select((.name // "" | ascii_downcase | contains($q))) | .uuid' <<<"$users_json"
+    return 0
+  fi
+  if [[ "$partial_count" == "0" ]]; then
+    echo "User not found by name/UUID: $key" >&2
+    exit 1
+  fi
+  refs="$(jq -r --arg q "$key_lc" '.[] | select((.name // "" | ascii_downcase | contains($q))) | "\(.name)(\(.uuid))"' <<<"$users_json" | paste -sd ', ' -)"
+  echo "Multiple matches for \"$key\": ${refs}" >&2
+  exit 1
+}
+
+PROTOCOL_SETTINGS=(
+  "hysteria2:hysteria_enable:hysteria,hy2,histeria,histeria2"
+  "hysteria2-obfs:hysteria_obfs_enable:hysteria-obfs,hy2-obfs"
+  "reality:reality_enable:"
+  "vless:vless_enable:"
+  "trojan:trojan_enable:"
+  "vmess:vmess_enable:"
+  "tuic:tuic_enable:"
+  "wireguard:wireguard_enable:wg"
+  "shadowtls:shadowtls_enable:"
+  "shadowsocks2022:shadowsocks2022_enable:ss2022"
+  "ssh:ssh_server_enable:"
+  "http-proxy:http_proxy_enable:httpproxy"
+  "v2ray:v2ray_enable:"
+  "ws:ws_enable:websocket"
+  "grpc:grpc_enable:"
+  "httpupgrade:httpupgrade_enable:http-upgrade"
+  "xhttp:xhttp_enable:"
+  "tcp:tcp_enable:"
+  "quic:quic_enable:"
+)
+
+resolve_protocol_key() {
+  local input row pname pkey palias alias arr
+  input="$(normalize_token "${1:-}")"
+  for row in "${PROTOCOL_SETTINGS[@]}"; do
+    IFS=':' read -r pname pkey palias <<<"$row"
+    if [[ "$(normalize_token "$pname")" == "$input" || "$(normalize_token "$pkey")" == "$input" ]]; then
+      printf '%s' "$pkey"
+      return 0
+    fi
+    IFS=',' read -r -a arr <<<"$palias"
+    for alias in "${arr[@]}"; do
+      [[ -n "$alias" ]] || continue
+      if [[ "$(normalize_token "$alias")" == "$input" ]]; then
+        printf '%s' "$pkey"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+resolve_protocol_name_by_key() {
+  local key row pname pkey palias
+  key="$(trim "${1:-}")"
+  for row in "${PROTOCOL_SETTINGS[@]}"; do
+    IFS=':' read -r pname pkey palias <<<"$row"
+    if [[ "$pkey" == "$key" ]]; then
+      printf '%s' "$pname"
+      return 0
+    fi
+  done
+  printf '%s' "$key"
+}
+
+parse_bool_like() {
+  case "$(normalize_token "${1:-}")" in
+    1|true|t|yes|y|on|enable|enabled) printf 'true' ;;
+    0|false|f|no|n|off|disable|disabled) printf 'false' ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_panel_http() {
+  local timeout i
+  timeout="${1:-45}"
+  i=0
+  while (( i < timeout )); do
+    if curl -fsS --max-time 2 "$PANEL_ADDR/" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    ((i+=1))
+  done
+  return 1
+}
+
+restart_hiddify_services() {
+  if [[ -x /opt/hiddify-manager/common/commander.py ]]; then
+    /opt/hiddify-manager/common/commander.py restart-services
+    return
+  fi
+  echo "Cannot restart services: /opt/hiddify-manager/common/commander.py not found" >&2
+  exit 1
+}
+
+ensure_true_unlimited_support() {
+  local panel_pkg_dir user_model_path hiddify_path changed
+  panel_pkg_dir="$(HIDDIFY_CFG_PATH="$PANEL_CFG_PATH" "$PANEL_PY" -c 'import pathlib,hiddifypanel; print(pathlib.Path(hiddifypanel.__file__).resolve().parent)')"
+  panel_pkg_dir="$(trim "$panel_pkg_dir")"
+  if [[ -z "$panel_pkg_dir" || "${panel_pkg_dir:0:1}" != "/" ]]; then
+    echo "Unable to detect hiddifypanel package directory" >&2
+    exit 1
+  fi
+  user_model_path="$panel_pkg_dir/models/user.py"
+  hiddify_path="$panel_pkg_dir/panel/hiddify.py"
+
+  changed="$(
+    PSAS_USER_MODEL="$user_model_path" PSAS_HIDDIFY_PY="$hiddify_path" "$PANEL_PY" - <<'PY'
+import os
+from pathlib import Path
+
+user_model = Path(os.environ["PSAS_USER_MODEL"])
+hiddify_py = Path(os.environ["PSAS_HIDDIFY_PY"])
+
+user_patches = [
+    (
+        """        is_active = True
+        if not self:
+            is_active = False
+        elif not self.enable:
+            is_active = False
+        elif self.usage_limit < self.current_usage:
+            is_active = False
+        elif self.remaining_days < 0:
+            is_active = False
+""",
+        """        is_active = True
+        unlimited_usage = self.usage_limit >= 1000000 * ONE_GIG
+        unlimited_days = (self.package_days or 0) >= 10000
+        if not self:
+            is_active = False
+        elif not self.enable:
+            is_active = False
+        elif (not unlimited_usage) and self.usage_limit < self.current_usage:
+            is_active = False
+        elif (not unlimited_days) and self.remaining_days < 0:
+            is_active = False
+""",
+        "unlimited_usage = self.usage_limit >= 1000000 * ONE_GIG",
+    ),
+    (
+        """        res = -1
+        if self.package_days is None:
+            res = -1
+        elif self.start_date:
+            # print(datetime.date.today(), u.start_date,u.package_days, u.package_days - (datetime.date.today() - u.start_date).days)
+            res = self.package_days - (datetime.date.today() - self.start_date).days
+        else:
+            # print("else",u.package_days )
+            res = self.package_days
+        return min(res, 10000)
+""",
+        """        if (self.package_days or 0) >= 10000:
+            return 10000
+
+        res = -1
+        if self.package_days is None:
+            res = -1
+        elif self.start_date:
+            # print(datetime.date.today(), u.start_date,u.package_days, u.package_days - (datetime.date.today() - self.start_date).days)
+            res = self.package_days - (datetime.date.today() - self.start_date).days
+        else:
+            # print("else",u.package_days )
+            res = self.package_days
+        return min(res, 10000)
+""",
+        "if (self.package_days or 0) >= 10000:",
+    ),
+]
+
+hiddify_patches = [
+    (
+        "    valid_users = [u.to_dict(dump_id=True) for u in User.query.filter((User.usage_limit > User.current_usage)).all() if u.is_active]\n",
+        "    valid_users = [u.to_dict(dump_id=True) for u in User.query.filter((User.usage_limit > User.current_usage) | (User.usage_limit >= 1000000 * 1024 * 1024 * 1024)).all() if u.is_active]\n",
+        "User.usage_limit >= 1000000 * 1024 * 1024 * 1024",
+    ),
+]
+
+def apply_patches(path: Path, patches):
+    text = path.read_text(encoding="utf-8")
+    changed = False
+    original = text
+    for old, new, marker in patches:
+        if marker and marker in text:
+            continue
+        if new in text:
+            continue
+        if old not in text:
+            raise RuntimeError(f"patch pattern not found in {path}")
+        text = text.replace(old, new, 1)
+        changed = True
+
+    if changed:
+        backup = Path(str(path) + ".psas.bak")
+        if not backup.exists():
+            backup.write_text(original, encoding="utf-8")
+        path.write_text(text, encoding="utf-8")
+    return changed
+
+changed = False
+changed = apply_patches(user_model, user_patches) or changed
+changed = apply_patches(hiddify_py, hiddify_patches) or changed
+print("1" if changed else "0")
+PY
+  )"
+
+  changed="$(trim "$changed")"
+  if [[ "$changed" != "1" ]]; then
+    return 0
+  fi
+
+  echo "Enabled true unlimited support in Hiddify."
+  restart_hiddify_services
+  if ! wait_panel_http 45; then
+    echo "Patch applied, but panel did not become reachable in time" >&2
+    exit 1
   fi
 }
 
@@ -232,9 +554,16 @@ usage() {
   cat <<'TXT'
 Usage:
   hiddify-sub list
-  hiddify-sub add --name NAME [--days 30] [--gb 100] [--mode no_reset|daily|weekly|monthly] [--host DOMAIN]
-  hiddify-sub show <USER_UUID> [--host DOMAIN]
-  hiddify-sub del <USER_UUID>
+  hiddify-sub add --name NAME [--subscription-name TITLE] [--days 30] [--gb 100] [--unlimited] [--unlimited-days] [--unlimited-gb] [--true-unlimited] [--true-unlimited-days] [--true-unlimited-gb] [--mode no_reset|daily|weekly|monthly] [--host DOMAIN] [--uuid UUID]
+  hiddify-sub edit <USER_ID> [--name NAME] [--subscription-name TITLE] [--days N] [--gb N] [--unlimited] [--unlimited-days] [--unlimited-gb] [--true-unlimited] [--true-unlimited-days] [--true-unlimited-gb] [--mode no_reset|daily|weekly|monthly] [--enable|--disable] [--host DOMAIN]
+  hiddify-sub show <USER_ID> [--host DOMAIN]
+  hiddify-sub del <USER_ID>
+  hiddify-sub protocols list
+  hiddify-sub protocols set <PROTOCOL> <on|off|true|false|1|0>
+  hiddify-sub protocols enable [--apply] <PROTOCOL>...
+  hiddify-sub protocols disable [--apply] <PROTOCOL>...
+
+USER_ID can be UUID or user name (exact/substring match).
 TXT
 }
 
@@ -243,55 +572,262 @@ cmd_list() {
 }
 
 cmd_add() {
-  local name="" days="30" gb="100" mode="no_reset" host=""
+  local name="" subscription_name="" days="30" gb="100" mode="no_reset" host="" custom_uuid=""
+  local unlimited=0 unlimited_days=0 unlimited_gb=0 true_unlimited=0 true_unlimited_days=0 true_unlimited_gb=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name) name="${2:-}"; shift 2 ;;
+      --subscription-name) subscription_name="${2:-}"; shift 2 ;;
       --days) days="${2:-}"; shift 2 ;;
       --gb) gb="${2:-}"; shift 2 ;;
+      --unlimited) unlimited=1; shift ;;
+      --unlimited-days) unlimited_days=1; shift ;;
+      --unlimited-gb) unlimited_gb=1; shift ;;
+      --true-unlimited) true_unlimited=1; shift ;;
+      --true-unlimited-days) true_unlimited_days=1; shift ;;
+      --true-unlimited-gb) true_unlimited_gb=1; shift ;;
       --mode) mode="${2:-}"; shift 2 ;;
       --host) host="${2:-}"; shift 2 ;;
+      --uuid) custom_uuid="${2:-}"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
-  [[ -n "$name" ]] || { echo "--name is required" >&2; exit 1; }
+  name="$(resolve_name_value "$name" "$subscription_name" yes)" || exit 1
   case "$mode" in
     no_reset|daily|weekly|monthly) ;;
     *) echo "Invalid --mode: $mode" >&2; exit 1 ;;
   esac
-  local u payload created
-  u="$(uuidgen | tr 'A-Z' 'a-z')"
+
+  if (( unlimited || unlimited_days || true_unlimited || true_unlimited_days )); then
+    days="$UNLIMITED_PACKAGE_DAYS"
+  fi
+  if (( unlimited || unlimited_gb || true_unlimited || true_unlimited_gb )); then
+    gb="$UNLIMITED_USAGE_GB"
+  fi
+
+  is_positive_int "$days" || { echo "--days must be >= 1 (or use --unlimited*/--true-unlimited*)" >&2; exit 1; }
+  is_positive_number "$gb" || { echo "--gb must be > 0 (or use --unlimited*/--true-unlimited*)" >&2; exit 1; }
+
+  if (( true_unlimited || true_unlimited_days || true_unlimited_gb )); then
+    ensure_true_unlimited_support
+  fi
+
+  local u payload created created_json
+  if [[ -n "$custom_uuid" ]]; then
+    is_uuid "$custom_uuid" || { echo "Invalid --uuid: $custom_uuid" >&2; exit 1; }
+    u="$(tr 'A-Z' 'a-z' <<<"$custom_uuid")"
+  else
+    u="$(uuidgen | tr 'A-Z' 'a-z')"
+  fi
   payload="$(jq -nc --arg uuid "$u" --arg name "$name" --argjson package_days "$days" --argjson usage_limit_GB "$gb" --arg mode "$mode" '{uuid:$uuid,name:$name,package_days:$package_days,usage_limit_GB:$usage_limit_GB,mode:$mode,enable:true}')"
-  created="$(api POST "user/" "$payload" | jq -r '.uuid')"
+  created_json="$(api POST "user/" "$payload")"
+  created="$(jq -r '.uuid // empty' <<<"$created_json")"
   [[ -n "$created" && "$created" != "null" ]] || { echo "Create failed" >&2; exit 1; }
   print_links "$created" "${host:-$MAIN_DOMAIN}"
 }
 
+cmd_edit() {
+  local user_id="" name="" subscription_name="" days="" gb="" mode="" host=""
+  local unlimited=0 unlimited_days=0 unlimited_gb=0 true_unlimited=0 true_unlimited_days=0 true_unlimited_gb=0
+  local set_enable=0 set_disable=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name="${2:-}"; shift 2 ;;
+      --subscription-name) subscription_name="${2:-}"; shift 2 ;;
+      --days) days="${2:-}"; shift 2 ;;
+      --gb) gb="${2:-}"; shift 2 ;;
+      --unlimited) unlimited=1; shift ;;
+      --unlimited-days) unlimited_days=1; shift ;;
+      --unlimited-gb) unlimited_gb=1; shift ;;
+      --true-unlimited) true_unlimited=1; shift ;;
+      --true-unlimited-days) true_unlimited_days=1; shift ;;
+      --true-unlimited-gb) true_unlimited_gb=1; shift ;;
+      --mode) mode="${2:-}"; shift 2 ;;
+      --enable) set_enable=1; shift ;;
+      --disable) set_disable=1; shift ;;
+      --host) host="${2:-}"; shift 2 ;;
+      -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      *)
+        if [[ -z "$user_id" ]]; then
+          user_id="$1"
+          shift
+        else
+          echo "Unexpected positional argument: $1" >&2
+          usage
+          exit 1
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "$user_id" ]] || { echo "USER_ID is required" >&2; usage; exit 1; }
+  local user_uuid
+  user_uuid="$(resolve_user_uuid "$user_id")"
+
+  local name_value
+  name_value="$(resolve_name_value "$name" "$subscription_name" no)" || exit 1
+  if [[ -n "$mode" ]]; then
+    case "$mode" in
+      no_reset|daily|weekly|monthly) ;;
+      *) echo "Invalid --mode: $mode" >&2; exit 1 ;;
+    esac
+  fi
+  if (( set_enable && set_disable )); then
+    echo "--enable and --disable cannot be used together" >&2
+    exit 1
+  fi
+
+  local has_days=0 has_gb=0
+  if [[ -n "$days" ]]; then has_days=1; fi
+  if [[ -n "$gb" ]]; then has_gb=1; fi
+  if (( unlimited || unlimited_days || true_unlimited || true_unlimited_days )); then
+    has_days=1
+    days="$UNLIMITED_PACKAGE_DAYS"
+  fi
+  if (( unlimited || unlimited_gb || true_unlimited || true_unlimited_gb )); then
+    has_gb=1
+    gb="$UNLIMITED_USAGE_GB"
+  fi
+
+  if (( has_days )); then
+    is_positive_int "$days" || { echo "--days must be >= 1 (or use --unlimited*/--true-unlimited*)" >&2; exit 1; }
+  fi
+  if (( has_gb )); then
+    is_positive_number "$gb" || { echo "--gb must be > 0 (or use --unlimited*/--true-unlimited*)" >&2; exit 1; }
+  fi
+
+  if (( true_unlimited || true_unlimited_days || true_unlimited_gb )); then
+    ensure_true_unlimited_support
+  fi
+
+  local payload="{}" changed=0
+  if [[ -n "$name_value" ]]; then
+    payload="$(jq -c --arg v "$name_value" '. + {name:$v}' <<<"$payload")"
+    changed=1
+  fi
+  if (( has_days )); then
+    payload="$(jq -c --argjson v "$days" '. + {package_days:$v}' <<<"$payload")"
+    changed=1
+  fi
+  if (( has_gb )); then
+    payload="$(jq -c --argjson v "$gb" '. + {usage_limit_GB:$v}' <<<"$payload")"
+    changed=1
+  fi
+  if [[ -n "$mode" ]]; then
+    payload="$(jq -c --arg v "$mode" '. + {mode:$v}' <<<"$payload")"
+    changed=1
+  fi
+  if (( set_enable )); then
+    payload="$(jq -c '. + {enable:true}' <<<"$payload")"
+    changed=1
+  fi
+  if (( set_disable )); then
+    payload="$(jq -c '. + {enable:false}' <<<"$payload")"
+    changed=1
+  fi
+
+  if (( ! changed )); then
+    echo "No changes requested for edit. Pass at least one edit flag." >&2
+    exit 1
+  fi
+
+  local updated_json updated_uuid
+  updated_json="$(api PATCH "user/$user_uuid/" "$payload")"
+  updated_uuid="$(jq -r '.uuid // empty' <<<"$updated_json")"
+  if [[ -z "$updated_uuid" ]]; then
+    updated_uuid="$user_uuid"
+  fi
+  print_links "$updated_uuid" "${host:-$MAIN_DOMAIN}"
+}
+
 cmd_show() {
-  local uuid="${1:-}"; shift || true
+  local user_id="${1:-}"; shift || true
   local host=""
-  [[ -n "$uuid" ]] || { echo "USER_UUID is required" >&2; exit 1; }
+  [[ -n "$user_id" ]] || { echo "USER_ID is required" >&2; exit 1; }
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --host) host="${2:-}"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
+  local uuid
+  uuid="$(resolve_user_uuid "$user_id")"
   api GET "user/$uuid/" >/dev/null
   print_links "$uuid" "${host:-$MAIN_DOMAIN}"
 }
 
 cmd_del() {
-  local uuid="${1:-}"
-  [[ -n "$uuid" ]] || { echo "USER_UUID is required" >&2; exit 1; }
+  local user_id="${1:-}"
+  [[ -n "$user_id" ]] || { echo "USER_ID is required" >&2; exit 1; }
+  local uuid
+  uuid="$(resolve_user_uuid "$user_id")"
   api DELETE "user/$uuid/" >/dev/null
-  echo "Deleted: $uuid"
+  echo "Deleted: $uuid (${user_id})"
+}
+
+cmd_protocols_list() {
+  local row pname pkey palias enabled
+  printf "PROTOCOL\tENABLED\tKEY\tALIASES\n"
+  for row in "${PROTOCOL_SETTINGS[@]}"; do
+    IFS=':' read -r pname pkey palias <<<"$row"
+    enabled="$(jq -r --arg k "$pkey" '.chconfigs["0"][$k] // false' <<<"$STATE_JSON")"
+    printf "%s\t%s\t%s\t%s\n" "$pname" "$enabled" "$pkey" "$palias"
+  done
+}
+
+cmd_protocols_set() {
+  local raw_proto="${1:-}" raw_value="${2:-}" pkey pvalue pname
+  [[ -n "$raw_proto" && -n "$raw_value" ]] || { echo "protocols set requires <PROTOCOL> <on|off|true|false|1|0>" >&2; exit 1; }
+  pkey="$(resolve_protocol_key "$raw_proto")" || { echo "Unknown protocol: $raw_proto" >&2; exit 1; }
+  pvalue="$(parse_bool_like "$raw_value")" || { echo "Invalid protocol value: $raw_value" >&2; exit 1; }
+  set_setting "$pkey" "$pvalue"
+  pname="$(resolve_protocol_name_by_key "$pkey")"
+  echo "Protocol $pname ($pkey) set to $pvalue"
+}
+
+cmd_protocols_switch() {
+  local desired="$1"; shift
+  local apply_now=0 raw_proto pkey pname
+  declare -A seen=()
+
+  if [[ "${1:-}" == "--apply" ]]; then
+    apply_now=1
+    shift
+  fi
+  [[ $# -ge 1 ]] || { echo "protocols $( [[ "$desired" == "true" ]] && echo enable || echo disable ) requires at least one protocol" >&2; exit 1; }
+
+  for raw_proto in "$@"; do
+    pkey="$(resolve_protocol_key "$raw_proto")" || { echo "Unknown protocol: $raw_proto" >&2; exit 1; }
+    if [[ -n "${seen[$pkey]:-}" ]]; then
+      continue
+    fi
+    seen[$pkey]=1
+    set_setting "$pkey" "$desired"
+    pname="$(resolve_protocol_name_by_key "$pkey")"
+    echo "Protocol $pname ($pkey) set to $desired"
+  done
+
+  if (( apply_now )); then
+    apply_config
+  fi
+}
+
+cmd_protocols() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    list|ls) cmd_protocols_list "$@" ;;
+    set) cmd_protocols_set "$@" ;;
+    enable) cmd_protocols_switch true "$@" ;;
+    disable) cmd_protocols_switch false "$@" ;;
+    *) echo "Unknown protocols subcommand: $sub" >&2; usage; exit 1 ;;
+  esac
 }
 
 main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    list|add|show|del|delete|rm) ;;
+    list|add|edit|update|set|show|del|delete|rm|protocols|protocol|proto) ;;
     -h|--help|help|"") usage; exit 0 ;;
     *) echo "Unknown command: $cmd" >&2; usage; exit 1 ;;
   esac
@@ -301,8 +837,10 @@ main() {
   case "$cmd" in
     list) cmd_list "$@" ;;
     add) cmd_add "$@" ;;
+    edit|update|set) cmd_edit "$@" ;;
     show) cmd_show "$@" ;;
     del|delete|rm) cmd_del "$@" ;;
+    protocols|protocol|proto) cmd_protocols "$@" ;;
   esac
 }
 
@@ -517,7 +1055,10 @@ print_summary() {
   echo "User management commands:"
   echo "  hiddify-sub list"
   echo "  hiddify-sub add --name user01 --days 30 --gb 300 --mode no_reset"
-  echo "  hiddify-sub show <USER_UUID>"
+  echo "  hiddify-sub edit user01 --subscription-name \"User01 iPhone\""
+  echo "  hiddify-sub add --name user01 --true-unlimited --mode no_reset"
+  echo "  hiddify-sub protocols enable hysteria2"
+  echo "  hiddify-sub show <USER_ID>"
   echo
   echo "Apply config safely after manual edits:"
   echo "  hiddify-apply-safe ${MAIN_DOMAIN}"

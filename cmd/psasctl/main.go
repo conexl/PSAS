@@ -18,12 +18,15 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 	"unicode"
 )
 
 const (
-	defaultPanelCfg  = "/opt/hiddify-manager/hiddify-panel/app.cfg"
-	defaultPanelAddr = "http://127.0.0.1:9000"
+	defaultPanelCfg      = "/opt/hiddify-manager/hiddify-panel/app.cfg"
+	defaultPanelAddr     = "http://127.0.0.1:9000"
+	unlimitedPackageDays = 10000
+	unlimitedUsageGB     = 1000000.0
 )
 
 type state struct {
@@ -68,9 +71,38 @@ type client struct {
 	state     state
 }
 
+type protocolSetting struct {
+	Name    string
+	Key     string
+	Aliases []string
+}
+
+var protocolSettings = []protocolSetting{
+	{Name: "hysteria2", Key: "hysteria_enable", Aliases: []string{"hysteria", "histeria", "histeria2", "hy2"}},
+	{Name: "hysteria2-obfs", Key: "hysteria_obfs_enable", Aliases: []string{"hysteria-obfs", "hy2-obfs"}},
+	{Name: "reality", Key: "reality_enable", Aliases: []string{}},
+	{Name: "vless", Key: "vless_enable", Aliases: []string{}},
+	{Name: "trojan", Key: "trojan_enable", Aliases: []string{}},
+	{Name: "vmess", Key: "vmess_enable", Aliases: []string{}},
+	{Name: "tuic", Key: "tuic_enable", Aliases: []string{}},
+	{Name: "wireguard", Key: "wireguard_enable", Aliases: []string{"wg"}},
+	{Name: "shadowtls", Key: "shadowtls_enable", Aliases: []string{}},
+	{Name: "shadowsocks2022", Key: "shadowsocks2022_enable", Aliases: []string{"ss2022"}},
+	{Name: "ssh", Key: "ssh_server_enable", Aliases: []string{}},
+	{Name: "http-proxy", Key: "http_proxy_enable", Aliases: []string{"httpproxy"}},
+	{Name: "v2ray", Key: "v2ray_enable", Aliases: []string{}},
+	{Name: "ws", Key: "ws_enable", Aliases: []string{"websocket"}},
+	{Name: "grpc", Key: "grpc_enable", Aliases: []string{}},
+	{Name: "httpupgrade", Key: "httpupgrade_enable", Aliases: []string{"http-upgrade"}},
+	{Name: "xhttp", Key: "xhttp_enable", Aliases: []string{}},
+	{Name: "tcp", Key: "tcp_enable", Aliases: []string{}},
+	{Name: "quic", Key: "quic_enable", Aliases: []string{}},
+}
+
 var uuidRe = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
 var ansiRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 var errUISelectionCanceled = errors.New("selection canceled")
+var errUIExitRequested = errors.New("exit requested")
 var errUIManualEntry = errors.New("manual entry requested")
 
 func main() {
@@ -91,6 +123,10 @@ func main() {
 		runUI(args)
 	case "users", "user", "u":
 		runUsers(args)
+	case "protocols", "protocol", "proto":
+		runProtocols(args)
+	case "list", "ls":
+		runListAlias(args)
 	case "config":
 		runConfig(args)
 	case "apply":
@@ -111,10 +147,16 @@ Usage:
   psasctl ui
   psasctl users list [--name QUERY] [--enabled] [--json]
   psasctl users find [--enabled] [--json] <QUERY>
-  psasctl users add --name NAME [--days 30] [--gb 100] [--mode no_reset] [--host DOMAIN] [--uuid UUID] [--json]
+  psasctl users add --name NAME [--subscription-name TITLE] [--days 30] [--gb 100] [--unlimited] [--unlimited-days] [--unlimited-gb] [--true-unlimited] [--true-unlimited-days] [--true-unlimited-gb] [--mode no_reset] [--host DOMAIN] [--uuid UUID] [--json]
+  psasctl users edit [--name NAME] [--subscription-name TITLE] [--days N] [--gb N] [--unlimited] [--unlimited-days] [--unlimited-gb] [--true-unlimited] [--true-unlimited-days] [--true-unlimited-gb] [--mode MODE] [--enable|--disable] [--host DOMAIN] [--json] <USER_ID>
   psasctl users show [--host DOMAIN] [--json] <USER_ID>
   psasctl users links [--host DOMAIN] [--json] <USER_ID>
   psasctl users del <USER_ID>
+  psasctl protocols list [--json]
+  psasctl list protocols [--json]
+  psasctl protocols set <PROTOCOL> <on|off|true|false|1|0>
+  psasctl protocols enable [--apply] <PROTOCOL>...
+  psasctl protocols disable [--apply] <PROTOCOL>...
   psasctl config get <key>
   psasctl config set <key> <value>
   psasctl apply
@@ -172,9 +214,25 @@ func runAdminURL(args []string) {
 	fmt.Println(c.adminURL(c.mainDomainRequired()))
 }
 
+func runListAlias(args []string) {
+	if len(args) < 1 {
+		fatalf("list requires target: users|protocols")
+	}
+	target := strings.ToLower(strings.TrimSpace(args[0]))
+	rest := args[1:]
+	switch target {
+	case "users", "user", "u":
+		runUsers(append([]string{"list"}, rest...))
+	case "protocols", "protocol", "proto":
+		runProtocols(append([]string{"list"}, rest...))
+	default:
+		fatalf("unknown list target: %s (expected users|protocols)", args[0])
+	}
+}
+
 func runUsers(args []string) {
 	if len(args) < 1 {
-		fatalf("users requires subcommand: list|find|add|show|links|del")
+		fatalf("users requires subcommand: list|find|add|edit|show|links|del")
 	}
 	c := mustClient(true)
 
@@ -268,8 +326,15 @@ func runUsers(args []string) {
 	case "add":
 		fs := flag.NewFlagSet("add", flag.ExitOnError)
 		name := fs.String("name", "", "user name")
+		subscriptionName := fs.String("subscription-name", "", "subscription/profile title (alias of --name)")
 		days := fs.Int("days", 30, "package days")
 		gb := fs.Float64("gb", 100, "usage limit in GB")
+		unlimited := fs.Bool("unlimited", false, "set practically unlimited traffic and time")
+		unlimitedDays := fs.Bool("unlimited-days", false, fmt.Sprintf("set package days to %d", unlimitedPackageDays))
+		unlimitedGB := fs.Bool("unlimited-gb", false, fmt.Sprintf("set usage limit to %.0f GB", unlimitedUsageGB))
+		trueUnlimited := fs.Bool("true-unlimited", false, "set truly unlimited traffic and time (auto-patches Hiddify once)")
+		trueUnlimitedDays := fs.Bool("true-unlimited-days", false, "set truly unlimited time (auto-patches Hiddify once)")
+		trueUnlimitedGB := fs.Bool("true-unlimited-gb", false, "set truly unlimited traffic (auto-patches Hiddify once)")
 		mode := fs.String("mode", "no_reset", "user mode: no_reset|daily|weekly|monthly")
 		host := fs.String("host", "", "domain for generated links")
 		uuid := fs.String("uuid", "", "custom UUID (optional)")
@@ -278,17 +343,31 @@ func runUsers(args []string) {
 		if len(fs.Args()) != 0 {
 			fatalf("users add takes only flags")
 		}
-		if *name == "" {
+		nameValue, err := resolveUserDisplayName(*name, *subscriptionName, true)
+		must(err)
+		if nameValue == "" {
 			fatalf("--name is required")
 		}
 		if !isValidMode(*mode) {
 			fatalf("invalid --mode: %s", *mode)
 		}
-		if *days < 1 {
-			fatalf("--days must be >= 1")
+		daysValue := *days
+		gbValue := *gb
+		useTrueUnlimited := *trueUnlimited || *trueUnlimitedDays || *trueUnlimitedGB
+		if *unlimited || *unlimitedDays || *trueUnlimited || *trueUnlimitedDays {
+			daysValue = unlimitedPackageDays
 		}
-		if *gb <= 0 {
-			fatalf("--gb must be > 0")
+		if *unlimited || *unlimitedGB || *trueUnlimited || *trueUnlimitedGB {
+			gbValue = unlimitedUsageGB
+		}
+		if daysValue < 1 {
+			fatalf("--days must be >= 1 (or use --unlimited/--unlimited-days/--true-unlimited-days)")
+		}
+		if gbValue <= 0 {
+			fatalf("--gb must be > 0 (or use --unlimited/--unlimited-gb/--true-unlimited-gb)")
+		}
+		if useTrueUnlimited {
+			must(c.ensureTrueUnlimitedSupport())
 		}
 		newID := strings.TrimSpace(*uuid)
 		if newID == "" {
@@ -298,9 +377,9 @@ func runUsers(args []string) {
 		}
 		payload := map[string]any{
 			"uuid":           strings.ToLower(newID),
-			"name":           *name,
-			"package_days":   *days,
-			"usage_limit_GB": *gb,
+			"name":           nameValue,
+			"package_days":   daysValue,
+			"usage_limit_GB": gbValue,
 			"mode":           *mode,
 			"enable":         true,
 		}
@@ -319,6 +398,117 @@ func runUsers(args []string) {
 			return
 		}
 		printLinksFromSet(links)
+	case "edit", "update", "set":
+		fs := flag.NewFlagSet("edit", flag.ExitOnError)
+		name := fs.String("name", "", "new user name")
+		subscriptionName := fs.String("subscription-name", "", "subscription/profile title (alias of --name)")
+		days := fs.Int("days", -1, "new package days (omit to keep current)")
+		gb := fs.Float64("gb", -1, "new usage limit in GB (omit to keep current)")
+		unlimited := fs.Bool("unlimited", false, "set practically unlimited traffic and time")
+		unlimitedDays := fs.Bool("unlimited-days", false, fmt.Sprintf("set package days to %d", unlimitedPackageDays))
+		unlimitedGB := fs.Bool("unlimited-gb", false, fmt.Sprintf("set usage limit to %.0f GB", unlimitedUsageGB))
+		trueUnlimited := fs.Bool("true-unlimited", false, "set truly unlimited traffic and time (auto-patches Hiddify once)")
+		trueUnlimitedDays := fs.Bool("true-unlimited-days", false, "set truly unlimited time (auto-patches Hiddify once)")
+		trueUnlimitedGB := fs.Bool("true-unlimited-gb", false, "set truly unlimited traffic (auto-patches Hiddify once)")
+		mode := fs.String("mode", "", "new user mode: no_reset|daily|weekly|monthly")
+		enableUser := fs.Bool("enable", false, "enable user")
+		disableUser := fs.Bool("disable", false, "disable user")
+		host := fs.String("host", "", "domain for generated links")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("users edit requires USER_ID")
+		}
+
+		u, err := c.resolveUser(rest[0])
+		must(err)
+
+		payload := map[string]any{}
+		changed := false
+
+		nameValue, err := resolveUserDisplayName(*name, *subscriptionName, false)
+		must(err)
+		if nameValue != "" {
+			payload["name"] = nameValue
+			changed = true
+		}
+
+		modeValue := strings.TrimSpace(*mode)
+		if modeValue != "" {
+			if !isValidMode(modeValue) {
+				fatalf("invalid --mode: %s", modeValue)
+			}
+			payload["mode"] = modeValue
+			changed = true
+		}
+
+		if *enableUser && *disableUser {
+			fatalf("--enable and --disable cannot be used together")
+		}
+		if *enableUser {
+			payload["enable"] = true
+			changed = true
+		}
+		if *disableUser {
+			payload["enable"] = false
+			changed = true
+		}
+
+		useTrueUnlimited := *trueUnlimited || *trueUnlimitedDays || *trueUnlimitedGB
+
+		hasDays := *days >= 0
+		daysValue := *days
+		if *unlimited || *unlimitedDays || *trueUnlimited || *trueUnlimitedDays {
+			hasDays = true
+			daysValue = unlimitedPackageDays
+		}
+		if hasDays {
+			if daysValue < 1 {
+				fatalf("--days must be >= 1 (or use --unlimited/--unlimited-days/--true-unlimited-days)")
+			}
+			payload["package_days"] = daysValue
+			changed = true
+		}
+
+		hasGB := *gb >= 0
+		gbValue := *gb
+		if *unlimited || *unlimitedGB || *trueUnlimited || *trueUnlimitedGB {
+			hasGB = true
+			gbValue = unlimitedUsageGB
+		}
+		if hasGB {
+			if gbValue <= 0 {
+				fatalf("--gb must be > 0 (or use --unlimited/--unlimited-gb/--true-unlimited-gb)")
+			}
+			payload["usage_limit_GB"] = gbValue
+			changed = true
+		}
+
+		if !changed {
+			fatalf("users edit: no changes requested; pass at least one edit flag")
+		}
+		if useTrueUnlimited {
+			must(c.ensureTrueUnlimitedSupport())
+		}
+
+		updated, err := c.userPatch(u.UUID, payload)
+		must(err)
+
+		h := strings.TrimSpace(*host)
+		if h == "" {
+			h = c.mainDomainRequired()
+		}
+		links := buildLinks(c.clientPath(), updated.UUID, h)
+		if *jsonOut {
+			printJSON(map[string]any{
+				"user":  updated,
+				"links": links,
+			})
+			return
+		}
+		printUser(updated)
+		printLinksFromSet(links)
 	case "del", "delete", "rm":
 		if len(subArgs) != 1 {
 			fatalf("users del requires USER_ID")
@@ -330,6 +520,124 @@ func runUsers(args []string) {
 	default:
 		fatalf("unknown users subcommand: %s", sub)
 	}
+}
+
+type protocolState struct {
+	Name    string   `json:"name"`
+	Key     string   `json:"key"`
+	Enabled bool     `json:"enabled"`
+	Aliases []string `json:"aliases,omitempty"`
+}
+
+func runProtocols(args []string) {
+	if len(args) < 1 {
+		fatalf("protocols requires subcommand: list|set|enable|disable")
+	}
+	c := mustClient(true)
+
+	sub := args[0]
+	subArgs := args[1:]
+
+	switch sub {
+	case "list", "ls":
+		fs := flag.NewFlagSet("protocols list", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("protocols list takes no positional args")
+		}
+		items := protocolStates(c.currentConfig())
+		if *jsonOut {
+			printJSON(items)
+			return
+		}
+		printProtocolStatesTable(items)
+	case "set":
+		if len(subArgs) != 2 {
+			fatalf("protocols set requires <PROTOCOL> <on|off|true|false|1|0>")
+		}
+		p, err := resolveProtocolSetting(subArgs[0])
+		must(err)
+		value, err := parseBoolLike(subArgs[1])
+		must(err)
+		must(c.setConfig(p.Key, strconv.FormatBool(value)))
+		fmt.Printf("Protocol %s (%s) set to %t\n", p.Name, p.Key, value)
+	case "enable", "disable":
+		fs := flag.NewFlagSet("protocols "+sub, flag.ExitOnError)
+		applyNow := fs.Bool("apply", false, "apply config after changes")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) == 0 {
+			fatalf("protocols %s requires at least one protocol", sub)
+		}
+		value := sub == "enable"
+		seen := map[string]bool{}
+		for _, raw := range rest {
+			p, err := resolveProtocolSetting(raw)
+			must(err)
+			if seen[p.Key] {
+				continue
+			}
+			seen[p.Key] = true
+			must(c.setConfig(p.Key, strconv.FormatBool(value)))
+			fmt.Printf("Protocol %s (%s) set to %t\n", p.Name, p.Key, value)
+		}
+		if *applyNow {
+			must(applyWithClient(c))
+		}
+	default:
+		fatalf("unknown protocols subcommand: %s", sub)
+	}
+}
+
+func protocolStates(cfg map[string]any) []protocolState {
+	out := make([]protocolState, 0, len(protocolSettings))
+	for _, p := range protocolSettings {
+		out = append(out, protocolState{
+			Name:    p.Name,
+			Key:     p.Key,
+			Enabled: anyToBool(cfg[p.Key]),
+			Aliases: append([]string(nil), p.Aliases...),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func printProtocolStatesTable(items []protocolState) {
+	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "PROTOCOL\tENABLED\tKEY\tALIASES")
+	for _, p := range items {
+		fmt.Fprintf(tw, "%s\t%t\t%s\t%s\n", p.Name, p.Enabled, p.Key, strings.Join(p.Aliases, ","))
+	}
+	_ = tw.Flush()
+}
+
+func resolveProtocolSetting(raw string) (protocolSetting, error) {
+	k := normalizeProtocolName(raw)
+	for _, p := range protocolSettings {
+		if normalizeProtocolName(p.Name) == k || normalizeProtocolName(p.Key) == k {
+			return p, nil
+		}
+		for _, alias := range p.Aliases {
+			if normalizeProtocolName(alias) == k {
+				return p, nil
+			}
+		}
+	}
+	known := make([]string, 0, len(protocolSettings))
+	for _, p := range protocolSettings {
+		known = append(known, p.Name)
+	}
+	sort.Strings(known)
+	return protocolSetting{}, fmt.Errorf("unknown protocol %q; known: %s", raw, strings.Join(known, ", "))
+}
+
+func normalizeProtocolName(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, " ", "")
+	s = strings.ReplaceAll(s, "_", "-")
+	return s
 }
 
 func runConfig(args []string) {
@@ -408,7 +716,9 @@ func runUI(args []string) {
 		{Key: "find", Shortcut: 'f', Title: "Find users", Hint: "Search users by name/part and optional enabled filter"},
 		{Key: "show", Shortcut: 'v', Title: "Show user + links", Hint: "Pick a user with arrows and print links"},
 		{Key: "add", Shortcut: 'a', Title: "Add user", Hint: "Step-by-step wizard for creating a user"},
+		{Key: "edit", Shortcut: 'e', Title: "Edit user", Hint: "Pick a user and edit name/limits/mode/enabled state"},
 		{Key: "delete", Shortcut: 'd', Title: "Delete user", Hint: "Pick a user and delete with confirmation"},
+		{Key: "protocols", Shortcut: 't', Title: "Protocols", Hint: "List and toggle protocol enable flags"},
 		{Key: "admin", Shortcut: 'u', Title: "Admin URL", Hint: "Print panel admin URL"},
 		{Key: "apply", Shortcut: 'p', Title: "Apply config", Hint: "Run hiddify-apply-safe or panel apply"},
 		{Key: "wizard", Shortcut: 'w', Title: "Flag command wizard", Hint: "Build and run existing psasctl commands with their original flags"},
@@ -440,8 +750,12 @@ func runUI(args []string) {
 			actionErr = uiShowUser(c, in)
 		case "add":
 			actionErr = uiAddUser(c, in)
+		case "edit":
+			actionErr = uiEditUser(c, in)
 		case "delete":
 			actionErr = uiDeleteUser(c, in)
+		case "protocols":
+			actionErr = uiProtocols(c, in)
 		case "admin":
 			actionErr = uiAdminURL(c)
 		case "apply":
@@ -453,13 +767,23 @@ func runUI(args []string) {
 		}
 
 		if actionErr != nil {
+			if errors.Is(actionErr, errUIExitRequested) {
+				clearScreen()
+				return
+			}
 			if errors.Is(actionErr, errUISelectionCanceled) {
-				printInfo("Canceled.")
+				fmt.Println("\nCanceled.")
 			} else {
-				printError(fmt.Sprintf("%v", actionErr))
+				fmt.Printf("\nERROR: %v\n", actionErr)
 			}
 		}
-		must(uiPause(in))
+		if err := uiPause(in); err != nil {
+			if errors.Is(err, errUIExitRequested) {
+				clearScreen()
+				return
+			}
+			fatalf("ui input error: %v", err)
+		}
 	}
 }
 
@@ -495,34 +819,32 @@ type terminalState struct {
 	sttyMode string
 }
 
-// Improved UI drawing functions
+// Simplified UI drawing functions
 func printBoxedHeader(title string) {
-	const width = 70
-	fmt.Println(strings.Repeat("=", width))
-	padding := (width - len(title)) / 2
-	fmt.Printf("%s%s\n", strings.Repeat(" ", padding), title)
-	fmt.Println(strings.Repeat("=", width))
+	fmt.Println()
+	fmt.Println(strings.ToUpper(title))
+	fmt.Println(strings.Repeat("=", len(title)))
 	fmt.Println()
 }
 
 func printSectionHeader(title string) {
-	fmt.Printf("\n--- %s ---\n", title)
+	fmt.Printf("\n%s:\n", title)
 }
 
 func printInfo(msg string) {
-	fmt.Printf("[i] %s\n", msg)
+	fmt.Printf("  %s\n", msg)
 }
 
 func printSuccess(msg string) {
-	fmt.Printf("[+] %s\n", msg)
+	fmt.Printf("  OK: %s\n", msg)
 }
 
 func printError(msg string) {
-	fmt.Printf("[!] %s\n", msg)
+	fmt.Printf("  ERROR: %s\n", msg)
 }
 
 func printSeparator() {
-	fmt.Println(strings.Repeat("-", 70))
+	fmt.Println(strings.Repeat("-", 60))
 }
 
 func uiSelectMenuItem(items []uiMenuItem, in *bufio.Reader) (uiMenuItem, error) {
@@ -599,22 +921,29 @@ func uiSelectMenuItem(items []uiMenuItem, in *bufio.Reader) (uiMenuItem, error) 
 
 func uiSelectMenuItemFallback(items []uiMenuItem, in *bufio.Reader) (uiMenuItem, error) {
 	clearScreen()
-	printBoxedHeader("psasctl interactive menu")
-	printInfo("Arrow-mode is unavailable in this terminal; fallback to number input.")
+
 	fmt.Println()
-	
+	fmt.Println("PSASCTL - Interactive Menu")
+	fmt.Println("===========================")
+	fmt.Println()
+
 	for i, item := range items {
 		fmt.Printf("  %d. %s\n", i+1, item.Title)
 	}
-	
+	fmt.Println("  q. Exit")
+
 	for {
-		raw, err := promptRequiredLine(in, "\nChoose option number")
+		raw, err := promptRequiredLine(in, "\nEnter option number (1-"+strconv.Itoa(len(items))+")")
 		if err != nil {
 			return uiMenuItem{}, err
 		}
-		n, err := strconv.Atoi(strings.TrimSpace(raw))
+		raw = strings.TrimSpace(raw)
+		if strings.EqualFold(raw, "q") {
+			return uiMenuItem{Key: "exit", Title: "Exit"}, nil
+		}
+		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 || n > len(items) {
-			printError(fmt.Sprintf("Invalid option. Enter number 1-%d.", len(items)))
+			printError(fmt.Sprintf("Invalid. Enter 1-%d or q", len(items)))
 			continue
 		}
 		return items[n-1], nil
@@ -623,44 +952,34 @@ func uiSelectMenuItemFallback(items []uiMenuItem, in *bufio.Reader) (uiMenuItem,
 
 func drawUIMenu(items []uiMenuItem, selected int) {
 	clearScreen()
-	
-	// Header
-	printBoxedHeader("psasctl interactive console")
-	
-	// Instructions - fixed width
-	fmt.Println("+--------------------------------------------------------------------+")
-	fmt.Println("| Navigation: Up/Down or j/k  |  Enter: Select  |  q: Exit           |")
-	fmt.Println("| Quick jump: 1-9             |  Shortcut keys in [brackets]         |")
-	fmt.Println("+--------------------------------------------------------------------+")
+
 	fmt.Println()
-	
-	// Menu items with fixed width
+	fmt.Println("PSASCTL - Interactive Menu")
+	fmt.Println("===========================")
+	fmt.Println()
+	fmt.Println("Controls: Up/Down or j/k to navigate, Enter to select, q to quit")
+	fmt.Println("Quick select: Press number 1-9 or shortcut key")
+	fmt.Println()
+
 	for i, item := range items {
-		cursor := "  "
+		prefix := "   "
 		if i == selected {
-			cursor = "> "
+			prefix = ">> "
 		}
-		
-		hotkey := "   "
+
+		shortcut := ""
 		if item.Shortcut != 0 {
-			hotkey = fmt.Sprintf("[%c]", unicode.ToLower(item.Shortcut))
+			shortcut = fmt.Sprintf(" [%c]", item.Shortcut)
 		}
-		
-		// Fixed format: cursor + number + title (padded to 30) + hotkey
-		titlePadded := item.Title
-		if len(titlePadded) > 28 {
-			titlePadded = titlePadded[:28]
-		}
-		fmt.Printf("%s%d. %-30s %s\n", cursor, i+1, titlePadded, hotkey)
+
+		fmt.Printf("%s%d. %s%s\n", prefix, i+1, item.Title, shortcut)
 	}
-	
-	// Hint section
+
 	if selected >= 0 && selected < len(items) && items[selected].Hint != "" {
 		fmt.Println()
-		fmt.Println("+--------------------------------------------------------------------+")
-		fmt.Printf("| Hint: %-62s |\n", items[selected].Hint)
-		fmt.Println("+--------------------------------------------------------------------+")
+		fmt.Printf("  * %s\n", items[selected].Hint)
 	}
+	fmt.Println()
 }
 
 func readUIMenuKey(in *bufio.Reader) (uiMenuInput, error) {
@@ -742,7 +1061,10 @@ func enterRawMode() (*terminalState, error) {
 		return nil, errors.New("failed to read tty mode")
 	}
 
-	set := exec.Command("stty", "raw", "-echo")
+	// FIX: `stty raw` часто отключает обработку вывода (-opost/-onlcr),
+	// и тогда '\n' НЕ возвращает курсор в колонку 0, из-за чего UI "едет".
+	// Включаем opost/onlcr обратно.
+	set := exec.Command("stty", "raw", "-echo", "opost", "onlcr")
 	set.Stdin = os.Stdin
 	if err := set.Run(); err != nil {
 		return nil, err
@@ -760,16 +1082,20 @@ func (s *terminalState) restore() {
 }
 
 func clearScreen() {
-	fmt.Print("\033[H\033[2J")
+	// Стандартнее: сначала очистить экран, потом переместиться домой
+	fmt.Print("\033[2J\033[H")
 }
 
 func uiPause(in *bufio.Reader) error {
-	fmt.Print("\n")
-	printSeparator()
-	fmt.Print("Press Enter to return to menu...")
-	_, err := in.ReadString('\n')
+	fmt.Println()
+	fmt.Println(strings.Repeat("-", 60))
+	fmt.Print("Press Enter to return to menu (q to exit)...")
+	raw, err := in.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(raw), "q") {
+		return errUIExitRequested
 	}
 	return nil
 }
@@ -782,7 +1108,7 @@ func uiRunFlagWizard(c *client, in *bufio.Reader) error {
 		{Value: "users-find", Title: "users find", Hint: "Supports --enabled, --json + QUERY"},
 		{Value: "users-show", Title: "users show", Hint: "Supports --host, --json + USER_ID"},
 		{Value: "users-links", Title: "users links", Hint: "Supports --host, --json + USER_ID"},
-		{Value: "users-add", Title: "users add", Hint: "Supports --name, --days, --gb, --mode, --host, --uuid, --json"},
+		{Value: "users-add", Title: "users add", Hint: "Supports --name, --days, --gb, --unlimited*, --true-unlimited*, --mode, --host, --uuid, --json"},
 		{Value: "users-del", Title: "users del", Hint: "Delete by USER_ID"},
 		{Value: "config-get", Title: "config get", Hint: "Get config by key"},
 		{Value: "config-set", Title: "config set", Hint: "Set config key/value"},
@@ -802,8 +1128,7 @@ func uiRunFlagWizard(c *client, in *bufio.Reader) error {
 		return errUISelectionCanceled
 	}
 
-	fmt.Printf("\n")
-	printInfo(fmt.Sprintf("Command: psasctl %s", quoteCommandArgs(args)))
+	fmt.Printf("\nCommand: psasctl %s\n", quoteCommandArgs(args))
 	runNow, err := promptYesNo(in, "Run this command?", true)
 	if err != nil {
 		return err
@@ -923,13 +1248,43 @@ func uiBuildWizardArgs(c *client, choice string, in *bufio.Reader) ([]string, er
 		if err != nil {
 			return nil, err
 		}
-		days, err := promptPositiveIntValue(in, "Package days (--days)", 30)
+		trueUnlimitedAll, err := promptYesNo(in, "True unlimited traffic + time? (--true-unlimited)", false)
 		if err != nil {
 			return nil, err
 		}
-		gb, err := promptPositiveFloatValue(in, "Usage limit GB (--gb)", 100)
-		if err != nil {
-			return nil, err
+		unlimitedAll := false
+		if !trueUnlimitedAll {
+			unlimitedAll, err = promptYesNo(in, "Unlimited traffic + time? (--unlimited)", false)
+			if err != nil {
+				return nil, err
+			}
+		}
+		useUnlimitedDays := false
+		useUnlimitedGB := false
+		days := 30
+		gb := 100.0
+		if !unlimitedAll && !trueUnlimitedAll {
+			useUnlimitedDays, err = promptYesNo(in, fmt.Sprintf("Unlimited package time? (--unlimited-days = %d days)", unlimitedPackageDays), false)
+			if err != nil {
+				return nil, err
+			}
+			if !useUnlimitedDays {
+				days, err = promptPositiveIntValue(in, "Package days (--days)", 30)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			useUnlimitedGB, err = promptYesNo(in, fmt.Sprintf("Unlimited traffic? (--unlimited-gb = %.0f GB)", unlimitedUsageGB), false)
+			if err != nil {
+				return nil, err
+			}
+			if !useUnlimitedGB {
+				gb, err = promptPositiveFloatValue(in, "Usage limit GB (--gb)", 100)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 		mode, err := uiSelectMode(in)
 		if err != nil {
@@ -950,9 +1305,23 @@ func uiBuildWizardArgs(c *client, choice string, in *bufio.Reader) ([]string, er
 		args := []string{
 			"users", "add",
 			"--name", name,
-			"--days", strconv.Itoa(days),
-			"--gb", strconv.FormatFloat(gb, 'f', -1, 64),
 			"--mode", mode,
+		}
+		if trueUnlimitedAll {
+			args = append(args, "--true-unlimited")
+		} else if unlimitedAll {
+			args = append(args, "--unlimited")
+		} else {
+			if useUnlimitedDays {
+				args = append(args, "--unlimited-days")
+			} else {
+				args = append(args, "--days", strconv.Itoa(days))
+			}
+			if useUnlimitedGB {
+				args = append(args, "--unlimited-gb")
+			} else {
+				args = append(args, "--gb", strconv.FormatFloat(gb, 'f', -1, 64))
+			}
 		}
 		if strings.TrimSpace(host) != "" {
 			args = append(args, "--host", strings.TrimSpace(host))
@@ -1163,18 +1532,20 @@ func uiSelectOptionValue(title string, options []uiOption, defaultIdx int, in *b
 
 func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx int, in *bufio.Reader) (string, error) {
 	clearScreen()
-	printBoxedHeader(title)
-	printInfo("Arrow-mode is unavailable; choose by number.")
+
 	fmt.Println()
-	
+	fmt.Println(title)
+	fmt.Println(strings.Repeat("=", len(title)))
+	fmt.Println()
+
 	for i, opt := range options {
 		fmt.Printf("  %d. %s\n", i+1, opt.Title)
 	}
 	fmt.Println("  q. Cancel")
-	
+
 	def := strconv.Itoa(defaultIdx + 1)
 	for {
-		raw, err := promptLine(in, "\nChoose option number", def)
+		raw, err := promptLine(in, "\nEnter option number", def)
 		if err != nil {
 			return "", err
 		}
@@ -1184,7 +1555,7 @@ func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx in
 		}
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 || n > len(options) {
-			printError(fmt.Sprintf("Invalid option. Enter number 1-%d or q.", len(options)))
+			printError(fmt.Sprintf("Invalid. Enter 1-%d or q", len(options)))
 			continue
 		}
 		return options[n-1].Value, nil
@@ -1193,27 +1564,27 @@ func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx in
 
 func drawUIOptionsMenu(title string, options []uiOption, selected int) {
 	clearScreen()
-	printBoxedHeader(title)
-	
-	fmt.Println("+--------------------------------------------------------------------+")
-	fmt.Println("| Navigation: Up/Down or j/k  |  Enter: Select  |  q: Cancel         |")
-	fmt.Println("+--------------------------------------------------------------------+")
+
 	fmt.Println()
-	
+	fmt.Println(title)
+	fmt.Println(strings.Repeat("=", len(title)))
+	fmt.Println()
+	fmt.Println("Controls: Up/Down or j/k, Enter to select, q to cancel")
+	fmt.Println()
+
 	for i, opt := range options {
-		cursor := "  "
+		prefix := "   "
 		if i == selected {
-			cursor = "> "
+			prefix = ">> "
 		}
-		fmt.Printf("%s%d. %-30s\n", cursor, i+1, opt.Title)
+		fmt.Printf("%s%d. %s\n", prefix, i+1, opt.Title)
 	}
-	
+
 	if selected >= 0 && selected < len(options) && options[selected].Hint != "" {
 		fmt.Println()
-		fmt.Println("+--------------------------------------------------------------------+")
-		fmt.Printf("| Hint: %-62s |\n", options[selected].Hint)
-		fmt.Println("+--------------------------------------------------------------------+")
+		fmt.Printf("  * %s\n", options[selected].Hint)
 	}
+	fmt.Println()
 }
 
 func uiPromptUserSelection(c *client, in *bufio.Reader, title, manualLabel string) (apiUser, error) {
@@ -1331,22 +1702,28 @@ func uiSelectUser(users []apiUser, title string, in *bufio.Reader) (apiUser, err
 
 func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiUser, error) {
 	clearScreen()
-	printBoxedHeader(title)
-	printInfo("Arrow-mode is unavailable; choose by number.")
+
 	fmt.Println()
-	
+	fmt.Println(title)
+	fmt.Println(strings.Repeat("=", len(title)))
+	fmt.Println()
+
 	for i, u := range users {
-		state := "disabled"
+		status := "OFF"
 		if u.Enable {
-			state = "enabled "
+			status = "ON"
 		}
-		fmt.Printf("  %d. %-20s %s [%s]\n", i+1, shortText(u.Name, 20), u.UUID, state)
+		name := u.Name
+		if len(name) > 20 {
+			name = name[:17] + "..."
+		}
+		fmt.Printf("  %d. %-20s %s [%s]\n", i+1, name, u.UUID, status)
 	}
 	fmt.Println("  0. Manual USER_ID input")
 	fmt.Println("  q. Cancel")
-	
+
 	for {
-		raw, err := promptRequiredLine(in, "\nChoose user number")
+		raw, err := promptRequiredLine(in, "\nEnter user number")
 		if err != nil {
 			return apiUser{}, err
 		}
@@ -1356,7 +1733,7 @@ func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiU
 		}
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 0 || n > len(users) {
-			printError(fmt.Sprintf("Invalid option. Enter number 0-%d or q.", len(users)))
+			printError(fmt.Sprintf("Invalid. Enter 0-%d or q", len(users)))
 			continue
 		}
 		if n == 0 {
@@ -1368,21 +1745,20 @@ func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiU
 
 func drawUIUserPicker(title string, users, filtered []apiUser, selected int, query string) {
 	clearScreen()
-	printBoxedHeader(title)
-	
-	fmt.Println("+--------------------------------------------------------------------+")
-	fmt.Println("| Navigation: Up/Down  |  Enter: Select  |  Type: Filter           |")
-	fmt.Println("| Backspace: Erase     |  i: Manual input  |  q: Cancel            |")
-	fmt.Println("+--------------------------------------------------------------------+")
+
 	fmt.Println()
-	
-	// Filter status
+	fmt.Println(title)
+	fmt.Println(strings.Repeat("=", len(title)))
+	fmt.Println()
+	fmt.Println("Controls: Up/Down to navigate, Enter to select, Type to filter")
+	fmt.Println("          Backspace to erase, i for manual input, q to cancel")
+	fmt.Println()
 	fmt.Printf("Filter: %s\n", query)
-	fmt.Printf("Matches: %d/%d\n", len(filtered), len(users))
-	printSeparator()
+	fmt.Printf("Showing: %d / %d users\n", len(filtered), len(users))
+	fmt.Println(strings.Repeat("-", 60))
 
 	if len(filtered) == 0 {
-		printInfo("No users match current filter.")
+		fmt.Println("  No users match current filter")
 		return
 	}
 
@@ -1399,29 +1775,31 @@ func drawUIUserPicker(title string, users, filtered []apiUser, selected int, que
 	}
 	end := min(len(filtered), start+pageSize)
 
-	// Table header
-	fmt.Printf("  %-20s %-38s %s\n", "NAME", "UUID", "STATUS")
-	printSeparator()
-	
+	fmt.Println()
 	for i := start; i < end; i++ {
 		u := filtered[i]
-		cursor := "  "
+		prefix := "   "
 		if i == selected {
-			cursor = "> "
+			prefix = ">> "
 		}
-		state := "disabled"
+
+		status := "OFF"
 		if u.Enable {
-			state = "enabled "
+			status = "ON "
 		}
-		
-		nameTrunc := shortText(u.Name, 20)
-		fmt.Printf("%s%-20s %-38s %s\n", cursor, nameTrunc, u.UUID, state)
+
+		name := u.Name
+		if len(name) > 20 {
+			name = name[:17] + "..."
+		}
+
+		fmt.Printf("%s%-20s  %s  [%s]\n", prefix, name, u.UUID, status)
 	}
 
 	if end < len(filtered) {
-		fmt.Println()
-		printInfo(fmt.Sprintf("Showing %d-%d of %d matches", start+1, end, len(filtered)))
+		fmt.Printf("\n  (Showing %d-%d of %d)\n", start+1, end, len(filtered))
 	}
+	fmt.Println()
 }
 
 func filterUsersForPicker(users []apiUser, query string) []apiUser {
@@ -1455,15 +1833,17 @@ func uiStatus(c *client) error {
 	cfg := c.currentConfig()
 	mainDomain := c.mainDomain()
 
-	printSectionHeader("System Status")
-	fmt.Printf("  Main domain        : %s\n", mainDomain)
-	fmt.Printf("  Admin URL          : %s\n", c.adminURL(mainDomain))
-	fmt.Printf("  Client path        : %v\n", cfg["proxy_path_client"])
-	fmt.Printf("  Reality enabled    : %v\n", cfg["reality_enable"])
-	fmt.Printf("  Hysteria2 enabled  : %v\n", cfg["hysteria_enable"])
-	fmt.Printf("  Hysteria base port : %v\n", cfg["hysteria_port"])
-	fmt.Printf("  Reality SNI        : %v\n", cfg["reality_server_names"])
-	fmt.Printf("  Users              : %d\n", len(c.state.Users))
+	fmt.Println()
+	fmt.Println("System Status")
+	fmt.Println("=============")
+	fmt.Printf("Main domain         : %s\n", mainDomain)
+	fmt.Printf("Admin URL           : %s\n", c.adminURL(mainDomain))
+	fmt.Printf("Client path         : %v\n", cfg["proxy_path_client"])
+	fmt.Printf("Reality enabled     : %v\n", cfg["reality_enable"])
+	fmt.Printf("Hysteria2 enabled   : %v\n", cfg["hysteria_enable"])
+	fmt.Printf("Hysteria base port  : %v\n", cfg["hysteria_port"])
+	fmt.Printf("Reality SNI         : %v\n", cfg["reality_server_names"])
+	fmt.Printf("Users               : %d\n", len(c.state.Users))
 	return nil
 }
 
@@ -1497,7 +1877,7 @@ func uiFindUsers(c *client, in *bufio.Reader) error {
 	}
 	users = filterUsers(users, query, isYes(enabledRaw))
 	if len(users) == 0 {
-		printInfo("No users found.")
+		fmt.Println("\nNo users found.")
 		return nil
 	}
 	printUsers(users)
@@ -1540,14 +1920,55 @@ func uiAddUser(c *client, in *bufio.Reader) error {
 		return err
 	}
 
-	days, err := promptPositiveIntValue(in, "Package days", 30)
+	trueUnlimitedAll, err := promptYesNo(in, "True unlimited traffic + time? (patches Hiddify once)", false)
 	if err != nil {
 		return err
 	}
+	needsTrueUnlimitedPatch := false
+	unlimitedAll := false
+	days := 30
+	gb := 100.0
+	if trueUnlimitedAll {
+		days = unlimitedPackageDays
+		gb = unlimitedUsageGB
+		needsTrueUnlimitedPatch = true
+	} else {
+		unlimitedAll, err = promptYesNo(in, "Unlimited traffic + time?", false)
+		if err != nil {
+			return err
+		}
+	}
+	if trueUnlimitedAll {
+		// already set above
+	} else if unlimitedAll {
+		days = unlimitedPackageDays
+		gb = unlimitedUsageGB
+	} else {
+		useUnlimitedDays, derr := promptYesNo(in, fmt.Sprintf("Unlimited package time? (%d days)", unlimitedPackageDays), false)
+		if derr != nil {
+			return derr
+		}
+		if useUnlimitedDays {
+			days = unlimitedPackageDays
+		} else {
+			days, derr = promptPositiveIntValue(in, "Package days", 30)
+			if derr != nil {
+				return derr
+			}
+		}
 
-	gb, err := promptPositiveFloatValue(in, "Usage limit (GB)", 100)
-	if err != nil {
-		return err
+		useUnlimitedGB, gerr := promptYesNo(in, fmt.Sprintf("Unlimited traffic? (%.0f GB)", unlimitedUsageGB), false)
+		if gerr != nil {
+			return gerr
+		}
+		if useUnlimitedGB {
+			gb = unlimitedUsageGB
+		} else {
+			gb, gerr = promptPositiveFloatValue(in, "Usage limit (GB)", 100)
+			if gerr != nil {
+				return gerr
+			}
+		}
 	}
 
 	mode, err := uiSelectMode(in)
@@ -1580,14 +2001,319 @@ func uiAddUser(c *client, in *bufio.Reader) error {
 		"mode":           mode,
 		"enable":         true,
 	}
+	if needsTrueUnlimitedPatch {
+		if err := c.ensureTrueUnlimitedSupport(); err != nil {
+			return err
+		}
+	}
 	u, err := c.userAdd(payload)
 	if err != nil {
 		return err
 	}
 	links := buildLinks(c.clientPath(), u.UUID, host)
-	printSuccess("User created.")
+	fmt.Println("\nUser created successfully!")
 	printLinksFromSet(links)
 	return nil
+}
+
+func uiEditUser(c *client, in *bufio.Reader) error {
+	if err := c.loadState(); err != nil {
+		return err
+	}
+
+	u, err := uiPromptUserSelection(c, in, "Select user to edit", "USER_ID to edit (UUID or name)")
+	if err != nil {
+		return err
+	}
+
+	payload := map[string]any{}
+	changed := false
+	needsTrueUnlimitedPatch := false
+
+	name, err := promptLine(in, fmt.Sprintf("Subscription/user name (empty = keep: %s)", u.Name), "")
+	if err != nil {
+		return err
+	}
+	name = strings.TrimSpace(name)
+	if name != "" && name != u.Name {
+		payload["name"] = name
+		changed = true
+	}
+
+	changeLimits, err := promptYesNo(in, "Change traffic/time limits?", false)
+	if err != nil {
+		return err
+	}
+	if changeLimits {
+		trueUnlimitedAll, terr := promptYesNo(in, "True unlimited traffic + time? (patches Hiddify once)", false)
+		if terr != nil {
+			return terr
+		}
+		if trueUnlimitedAll {
+			payload["package_days"] = unlimitedPackageDays
+			payload["usage_limit_GB"] = unlimitedUsageGB
+			changed = true
+			needsTrueUnlimitedPatch = true
+		} else {
+			unlimitedAll, uerr := promptYesNo(in, "Practical unlimited traffic + time?", false)
+			if uerr != nil {
+				return uerr
+			}
+			if unlimitedAll {
+				payload["package_days"] = unlimitedPackageDays
+				payload["usage_limit_GB"] = unlimitedUsageGB
+				changed = true
+			} else {
+				daysAction, derr := uiSelectOptionValue("Package days", []uiOption{
+					{Value: "keep", Title: fmt.Sprintf("Keep (%d days)", u.PackageDays), Hint: "Do not change package days"},
+					{Value: "set", Title: "Set custom days", Hint: "Enter a specific positive number of days"},
+					{Value: "unlimited", Title: fmt.Sprintf("Practical unlimited (%d days)", unlimitedPackageDays), Hint: "Set to large value"},
+					{Value: "true-unlimited", Title: "True unlimited days", Hint: "Set unlimited logic in patched Hiddify"},
+				}, 0, in)
+				if derr != nil {
+					return derr
+				}
+				switch daysAction {
+				case "set":
+					days, perr := promptPositiveIntValue(in, "Package days", max(1, u.PackageDays))
+					if perr != nil {
+						return perr
+					}
+					payload["package_days"] = days
+					changed = true
+				case "unlimited":
+					payload["package_days"] = unlimitedPackageDays
+					changed = true
+				case "true-unlimited":
+					payload["package_days"] = unlimitedPackageDays
+					changed = true
+					needsTrueUnlimitedPatch = true
+				}
+
+				gbAction, gerr := uiSelectOptionValue("Traffic limit", []uiOption{
+					{Value: "keep", Title: fmt.Sprintf("Keep (%.2f GB)", u.UsageLimitGB), Hint: "Do not change usage limit"},
+					{Value: "set", Title: "Set custom GB", Hint: "Enter a specific positive traffic limit"},
+					{Value: "unlimited", Title: fmt.Sprintf("Practical unlimited (%.0f GB)", unlimitedUsageGB), Hint: "Set to large value"},
+					{Value: "true-unlimited", Title: "True unlimited traffic", Hint: "Set unlimited logic in patched Hiddify"},
+				}, 0, in)
+				if gerr != nil {
+					return gerr
+				}
+				switch gbAction {
+				case "set":
+					defGB := u.UsageLimitGB
+					if defGB <= 0 {
+						defGB = 1
+					}
+					gb, perr := promptPositiveFloatValue(in, "Usage limit (GB)", defGB)
+					if perr != nil {
+						return perr
+					}
+					payload["usage_limit_GB"] = gb
+					changed = true
+				case "unlimited":
+					payload["usage_limit_GB"] = unlimitedUsageGB
+					changed = true
+				case "true-unlimited":
+					payload["usage_limit_GB"] = unlimitedUsageGB
+					changed = true
+					needsTrueUnlimitedPatch = true
+				}
+			}
+		}
+	}
+
+	modeChoice, merr := uiSelectOptionValue("User mode", []uiOption{
+		{Value: "keep", Title: fmt.Sprintf("Keep (%s)", u.Mode), Hint: "Do not change user mode"},
+		{Value: "no_reset", Title: "no_reset", Hint: "No periodic reset"},
+		{Value: "daily", Title: "daily", Hint: "Reset usage every day"},
+		{Value: "weekly", Title: "weekly", Hint: "Reset usage every week"},
+		{Value: "monthly", Title: "monthly", Hint: "Reset usage every month"},
+	}, 0, in)
+	if merr != nil {
+		return merr
+	}
+	if modeChoice != "keep" && modeChoice != u.Mode {
+		payload["mode"] = modeChoice
+		changed = true
+	}
+
+	stateText := "OFF"
+	if u.Enable {
+		stateText = "ON"
+	}
+	enableChoice, eerr := uiSelectOptionValue("Enabled state", []uiOption{
+		{Value: "keep", Title: fmt.Sprintf("Keep (%s)", stateText), Hint: "Do not change enable state"},
+		{Value: "enable", Title: "Enable", Hint: "Force user enabled"},
+		{Value: "disable", Title: "Disable", Hint: "Force user disabled"},
+	}, 0, in)
+	if eerr != nil {
+		return eerr
+	}
+	if enableChoice == "enable" && !u.Enable {
+		payload["enable"] = true
+		changed = true
+	}
+	if enableChoice == "disable" && u.Enable {
+		payload["enable"] = false
+		changed = true
+	}
+
+	if !changed {
+		fmt.Println("\nNo changes requested.")
+		return nil
+	}
+
+	if needsTrueUnlimitedPatch {
+		if err := c.ensureTrueUnlimitedSupport(); err != nil {
+			return err
+		}
+	}
+
+	updated, err := c.userPatch(u.UUID, payload)
+	if err != nil {
+		return err
+	}
+
+	host, err := promptLine(in, "Host for links (empty = main domain)", "")
+	if err != nil {
+		return err
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host, err = c.mainDomainOrErr()
+		if err != nil {
+			return err
+		}
+	}
+
+	links := buildLinks(c.clientPath(), updated.UUID, host)
+	fmt.Println("\nUser updated successfully!")
+	printUser(updated)
+	fmt.Println()
+	printLinksFromSet(links)
+	return nil
+}
+
+func uiProtocols(c *client, in *bufio.Reader) error {
+	if err := c.loadState(); err != nil {
+		return err
+	}
+
+	printSectionHeader("Protocols")
+	printProtocolStatesTable(protocolStates(c.currentConfig()))
+
+	for {
+		action, err := uiSelectOptionValue("Protocol action", []uiOption{
+			{Value: "list", Title: "List protocols", Hint: "Show current protocol enabled flags"},
+			{Value: "enable", Title: "Enable protocol", Hint: "Set one protocol key to true"},
+			{Value: "disable", Title: "Disable protocol", Hint: "Set one protocol key to false"},
+			{Value: "set", Title: "Set protocol value", Hint: "Set protocol via on/off/true/false/1/0"},
+			{Value: "back", Title: "Back", Hint: "Return to main menu"},
+		}, 0, in)
+		if err != nil {
+			if errors.Is(err, errUISelectionCanceled) {
+				return nil
+			}
+			return err
+		}
+
+		switch action {
+		case "back":
+			return nil
+		case "list":
+			if err := c.loadState(); err != nil {
+				return err
+			}
+			fmt.Println()
+			printProtocolStatesTable(protocolStates(c.currentConfig()))
+			fmt.Println()
+			fmt.Print("Press Enter to continue (q to back)...")
+			raw, rerr := in.ReadString('\n')
+			if rerr != nil && !errors.Is(rerr, io.EOF) {
+				return rerr
+			}
+			if strings.EqualFold(strings.TrimSpace(raw), "q") {
+				return nil
+			}
+		case "enable", "disable", "set":
+			if err := c.loadState(); err != nil {
+				return err
+			}
+			p, perr := uiSelectProtocol(c, in, "Select protocol")
+			if perr != nil {
+				if errors.Is(perr, errUISelectionCanceled) {
+					continue
+				}
+				return perr
+			}
+
+			newValue := false
+			switch action {
+			case "enable":
+				newValue = true
+			case "disable":
+				newValue = false
+			case "set":
+				raw, rerr := promptRequiredLine(in, "Value (on/off/true/false/1/0)")
+				if rerr != nil {
+					return rerr
+				}
+				parsed, perr := parseBoolLike(raw)
+				if perr != nil {
+					return perr
+				}
+				newValue = parsed
+			}
+
+			if err := c.setConfig(p.Key, strconv.FormatBool(newValue)); err != nil {
+				return err
+			}
+			fmt.Printf("\nProtocol %s (%s) set to %t\n", p.Name, p.Key, newValue)
+
+			applyNow, aerr := promptYesNo(in, "Apply config now?", false)
+			if aerr != nil {
+				return aerr
+			}
+			if applyNow {
+				if err := applyWithClient(c); err != nil {
+					return err
+				}
+			}
+
+			if err := c.loadState(); err != nil {
+				return err
+			}
+			fmt.Println()
+			printProtocolStatesTable(protocolStates(c.currentConfig()))
+		}
+	}
+}
+
+func uiSelectProtocol(c *client, in *bufio.Reader, title string) (protocolSetting, error) {
+	items := protocolStates(c.currentConfig())
+	if len(items) == 0 {
+		return protocolSetting{}, errors.New("no protocols available")
+	}
+
+	options := make([]uiOption, 0, len(items))
+	for _, item := range items {
+		status := "OFF"
+		if item.Enabled {
+			status = "ON"
+		}
+		options = append(options, uiOption{
+			Value: item.Key,
+			Title: fmt.Sprintf("%s [%s]", item.Name, status),
+			Hint:  item.Key,
+		})
+	}
+
+	choice, err := uiSelectOptionValue(title, options, 0, in)
+	if err != nil {
+		return protocolSetting{}, err
+	}
+	return resolveProtocolSetting(choice)
 }
 
 func uiDeleteUser(c *client, in *bufio.Reader) error {
@@ -1599,20 +2325,19 @@ func uiDeleteUser(c *client, in *bufio.Reader) error {
 		return err
 	}
 
-	fmt.Printf("\n")
-	printInfo(fmt.Sprintf("About to delete: %s (%s)", u.UUID, u.Name))
+	fmt.Printf("\nAbout to delete: %s (%s)\n", u.UUID, u.Name)
 	confirm, err := promptLine(in, "Confirm delete? (yes/no)", "no")
 	if err != nil {
 		return err
 	}
 	if !isYes(confirm) {
-		printInfo("Canceled.")
+		fmt.Println("Canceled.")
 		return nil
 	}
 	if err := c.userDelete(u.UUID); err != nil {
 		return err
 	}
-	printSuccess(fmt.Sprintf("Deleted: %s (%s)", u.UUID, u.Name))
+	fmt.Printf("\nDeleted: %s (%s)\n", u.UUID, u.Name)
 	return nil
 }
 
@@ -1771,6 +2496,18 @@ func (c *client) userAdd(payload map[string]any) (apiUser, error) {
 	return u, nil
 }
 
+func (c *client) userPatch(uuid string, payload map[string]any) (apiUser, error) {
+	b, err := c.api(http.MethodPatch, "user/"+uuid+"/", payload)
+	if err != nil {
+		return apiUser{}, err
+	}
+	var u apiUser
+	if err := json.Unmarshal(b, &u); err != nil {
+		return apiUser{}, err
+	}
+	return u, nil
+}
+
 func (c *client) userDelete(uuid string) error {
 	_, err := c.api(http.MethodDelete, "user/"+uuid+"/", nil)
 	return err
@@ -1829,6 +2566,196 @@ func (c *client) resolveUser(id string) (apiUser, error) {
 func (c *client) setConfig(key, value string) error {
 	_, err := c.runPanel("set-setting", "-k", key, "-v", value)
 	return err
+}
+
+type textPatch struct {
+	Old    string
+	New    string
+	Marker string
+}
+
+func (c *client) ensureTrueUnlimitedSupport() error {
+	panelPkgDir, err := c.panelPackageDir()
+	if err != nil {
+		return err
+	}
+
+	userModelPath := filepath.Join(panelPkgDir, "models", "user.py")
+	hiddifyPath := filepath.Join(panelPkgDir, "panel", "hiddify.py")
+
+	userPatches := []textPatch{
+		{
+			Old: `        is_active = True
+        if not self:
+            is_active = False
+        elif not self.enable:
+            is_active = False
+        elif self.usage_limit < self.current_usage:
+            is_active = False
+        elif self.remaining_days < 0:
+            is_active = False
+`,
+			New: `        is_active = True
+        unlimited_usage = self.usage_limit >= 1000000 * ONE_GIG
+        unlimited_days = (self.package_days or 0) >= 10000
+        if not self:
+            is_active = False
+        elif not self.enable:
+            is_active = False
+        elif (not unlimited_usage) and self.usage_limit < self.current_usage:
+            is_active = False
+        elif (not unlimited_days) and self.remaining_days < 0:
+            is_active = False
+`,
+			Marker: "unlimited_usage = self.usage_limit >= 1000000 * ONE_GIG",
+		},
+		{
+			Old: `        res = -1
+        if self.package_days is None:
+            res = -1
+        elif self.start_date:
+            # print(datetime.date.today(), u.start_date,u.package_days, u.package_days - (datetime.date.today() - u.start_date).days)
+            res = self.package_days - (datetime.date.today() - self.start_date).days
+        else:
+            # print("else",u.package_days )
+            res = self.package_days
+        return min(res, 10000)
+`,
+			New: `        if (self.package_days or 0) >= 10000:
+            return 10000
+
+        res = -1
+        if self.package_days is None:
+            res = -1
+        elif self.start_date:
+            # print(datetime.date.today(), u.start_date,u.package_days, u.package_days - (datetime.date.today() - self.start_date).days)
+            res = self.package_days - (datetime.date.today() - self.start_date).days
+        else:
+            # print("else",u.package_days )
+            res = self.package_days
+        return min(res, 10000)
+`,
+			Marker: "if (self.package_days or 0) >= 10000:",
+		},
+	}
+	hiddifyPatches := []textPatch{
+		{
+			Old:    "    valid_users = [u.to_dict(dump_id=True) for u in User.query.filter((User.usage_limit > User.current_usage)).all() if u.is_active]\n",
+			New:    "    valid_users = [u.to_dict(dump_id=True) for u in User.query.filter((User.usage_limit > User.current_usage) | (User.usage_limit >= 1000000 * 1024 * 1024 * 1024)).all() if u.is_active]\n",
+			Marker: "User.usage_limit >= 1000000 * 1024 * 1024 * 1024",
+		},
+	}
+
+	changedUsers, err := applyTextPatches(userModelPath, userPatches)
+	if err != nil {
+		return fmt.Errorf("true-unlimited patch failed for %s: %w", userModelPath, err)
+	}
+	changedHiddify, err := applyTextPatches(hiddifyPath, hiddifyPatches)
+	if err != nil {
+		return fmt.Errorf("true-unlimited patch failed for %s: %w", hiddifyPath, err)
+	}
+
+	if !changedUsers && !changedHiddify {
+		return nil
+	}
+
+	fmt.Println("Enabled true unlimited support in Hiddify.")
+	if err := restartHiddifyServices(); err != nil {
+		return fmt.Errorf("true-unlimited patch applied, but failed to restart services: %w", err)
+	}
+	if err := c.waitPanelHTTP(45 * time.Second); err != nil {
+		return fmt.Errorf("true-unlimited patch applied, but panel did not become reachable in time: %w", err)
+	}
+	return nil
+}
+
+func applyTextPatches(path string, patches []textPatch) (bool, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	orig := string(raw)
+	updated := orig
+
+	for _, p := range patches {
+		if p.Marker != "" && strings.Contains(updated, p.Marker) {
+			continue
+		}
+		if p.New != "" && strings.Contains(updated, p.New) {
+			continue
+		}
+		if !strings.Contains(updated, p.Old) {
+			return false, fmt.Errorf("patch pattern not found")
+		}
+		updated = strings.Replace(updated, p.Old, p.New, 1)
+	}
+
+	if updated == orig {
+		return false, nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	backupPath := path + ".psas.bak"
+	if !fileExists(backupPath) {
+		if err := os.WriteFile(backupPath, raw, info.Mode()); err != nil {
+			return false, err
+		}
+	}
+	if err := os.WriteFile(path, []byte(updated), info.Mode()); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *client) panelPackageDir() (string, error) {
+	cmd := exec.Command(c.panelPy, "-c", "import pathlib,hiddifypanel; print(pathlib.Path(hiddifypanel.__file__).resolve().parent)")
+	cmd.Env = append(os.Environ(), "HIDDIFY_CFG_PATH="+c.panelCfg)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("detect hiddifypanel package dir: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	lines := strings.Split(strings.ReplaceAll(string(out), "\r", ""), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		dir := strings.TrimSpace(lines[i])
+		if dir == "" {
+			continue
+		}
+		if !filepath.IsAbs(dir) {
+			return "", fmt.Errorf("invalid hiddifypanel package dir: %q", dir)
+		}
+		return dir, nil
+	}
+	return "", errors.New("empty output while detecting hiddifypanel package dir")
+}
+
+func restartHiddifyServices() error {
+	if fileExists("/opt/hiddify-manager/common/commander.py") {
+		return runCommand("/opt/hiddify-manager/common/commander.py", "restart-services")
+	}
+	return errors.New("/opt/hiddify-manager/common/commander.py not found")
+}
+
+func (c *client) waitPanelHTTP(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	url := strings.TrimRight(c.panelAddr, "/") + "/"
+	httpClient := &http.Client{Timeout: 3 * time.Second}
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := httpClient.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			return nil
+		}
+		lastErr = err
+		time.Sleep(1 * time.Second)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("panel is not reachable")
+	}
+	return lastErr
 }
 
 func (c *client) currentConfig() map[string]any {
@@ -1912,13 +2839,15 @@ func filterUsers(users []apiUser, nameFilter string, enabledOnly bool) []apiUser
 }
 
 func printUser(u apiUser) {
-	printSectionHeader("User Details")
-	fmt.Printf("  UUID       : %s\n", u.UUID)
-	fmt.Printf("  Name       : %s\n", u.Name)
-	fmt.Printf("  Enabled    : %t\n", u.Enable)
-	fmt.Printf("  Limit GB   : %.2f\n", u.UsageLimitGB)
-	fmt.Printf("  Days       : %d\n", u.PackageDays)
-	fmt.Printf("  Mode       : %s\n", u.Mode)
+	fmt.Println()
+	fmt.Println("User Details")
+	fmt.Println("============")
+	fmt.Printf("UUID      : %s\n", u.UUID)
+	fmt.Printf("Name      : %s\n", u.Name)
+	fmt.Printf("Enabled   : %t\n", u.Enable)
+	fmt.Printf("Limit GB  : %.2f\n", u.UsageLimitGB)
+	fmt.Printf("Days      : %d\n", u.PackageDays)
+	fmt.Printf("Mode      : %s\n", u.Mode)
 }
 
 func buildLinks(clientPath, uuid, host string) linkSet {
@@ -1935,13 +2864,15 @@ func buildLinks(clientPath, uuid, host string) linkSet {
 }
 
 func printLinksFromSet(l linkSet) {
-	printSectionHeader("Access Links")
-	fmt.Printf("  User UUID          : %s\n", l.UUID)
-	fmt.Printf("  Panel URL          : %s\n", l.Panel)
-	fmt.Printf("  Hiddify (auto)     : %s\n", l.Auto)
-	fmt.Printf("  Subscription b64   : %s\n", l.Sub64)
-	fmt.Printf("  Subscription plain : %s\n", l.Sub)
-	fmt.Printf("  Sing-box           : %s\n", l.Singbox)
+	fmt.Println()
+	fmt.Println("Access Links")
+	fmt.Println("============")
+	fmt.Printf("User UUID           : %s\n", l.UUID)
+	fmt.Printf("Panel URL           : %s\n", l.Panel)
+	fmt.Printf("Hiddify (auto)      : %s\n", l.Auto)
+	fmt.Printf("Subscription b64    : %s\n", l.Sub64)
+	fmt.Printf("Subscription plain  : %s\n", l.Sub)
+	fmt.Printf("Sing-box            : %s\n", l.Singbox)
 }
 
 func formatUserRefs(users []apiUser) string {
@@ -2127,6 +3058,71 @@ func parsePositiveFloat(s string) (float64, error) {
 		return 0, errors.New("must be > 0")
 	}
 	return v, nil
+}
+
+func resolveUserDisplayName(name, subscriptionName string, required bool) (string, error) {
+	n := strings.TrimSpace(name)
+	s := strings.TrimSpace(subscriptionName)
+	if s != "" {
+		if n != "" && n != s {
+			return "", errors.New("--name and --subscription-name must be the same when both are provided")
+		}
+		n = s
+	}
+	if required && n == "" {
+		return "", errors.New("name is required")
+	}
+	return n, nil
+}
+
+func parseBoolLike(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "t", "yes", "y", "on", "enable", "enabled":
+		return true, nil
+	case "0", "false", "f", "no", "n", "off", "disable", "disabled":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean value: %s", raw)
+	}
+}
+
+func anyToBool(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		b, err := parseBoolLike(x)
+		if err == nil {
+			return b
+		}
+		return strings.TrimSpace(x) != ""
+	case float64:
+		return x != 0
+	case float32:
+		return x != 0
+	case int:
+		return x != 0
+	case int8:
+		return x != 0
+	case int16:
+		return x != 0
+	case int32:
+		return x != 0
+	case int64:
+		return x != 0
+	case uint:
+		return x != 0
+	case uint8:
+		return x != 0
+	case uint16:
+		return x != 0
+	case uint32:
+		return x != 0
+	case uint64:
+		return x != 0
+	default:
+		return false
+	}
 }
 
 func isYes(s string) bool {

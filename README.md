@@ -60,13 +60,22 @@ sudo ./psas-install.sh
 ```bash
 hiddify-sub list
 hiddify-sub add --name user01 --days 30 --gb 300 --mode no_reset
-hiddify-sub show <USER_UUID>
-hiddify-sub del <USER_UUID>
+hiddify-sub add --name user01 --true-unlimited --mode no_reset
+hiddify-sub edit user01 --subscription-name "User01 iPhone"
+hiddify-sub show <USER_ID>
+hiddify-sub del <USER_ID>
+hiddify-sub protocols list
+hiddify-sub protocols enable hysteria2
 ```
 
 `add` сразу печатает ссылки:
 - `/auto/` — рекомендуемый импорт в Hiddify,
 - `/sub64/`, `/sub/`, `/singbox/`.
+
+Примечания:
+- `USER_ID` может быть UUID или имя (точное/частичное совпадение).
+- Флаги `--subscription-name` и `--name` эквивалентны (название профиля подписки пользователя).
+- `--true-unlimited*` включает настоящий безлимит (автоматический patch Hiddify + restart сервисов при первом запуске).
 
 ## 5) Go CLI (`psasctl`)
 
@@ -89,7 +98,13 @@ psasctl users list
 psasctl users list --enabled
 psasctl users find user01
 psasctl users add --name test --days 30 --gb 100 --mode no_reset
+psasctl users add --subscription-name "Office iPhone" --days 30 --gb 100 --mode no_reset
+psasctl users add --name test --unlimited --mode no_reset
+psasctl users add --name test --true-unlimited --mode no_reset
+psasctl users add --name test --unlimited-gb --unlimited-days --mode no_reset
 psasctl users add --name test --json
+psasctl users edit user01 --days 60 --gb 500 --mode monthly
+psasctl users edit user01 --subscription-name "User01 Main" --true-unlimited-gb
 
 # USER_ID = UUID или имя пользователя
 psasctl users links <USER_ID>
@@ -100,9 +115,16 @@ psasctl users links user01
 
 psasctl config get reality_enable
 psasctl config set vmess_enable false
+psasctl protocols list
+psasctl protocols enable hysteria2
+psasctl protocols disable --apply tuic vmess
 
 psasctl apply
 ```
+
+Примечания:
+- Флаги `--subscription-name` и `--name` для пользователя эквивалентны (в Hiddify это один и тот же профильный title).
+- Для настоящего безлимита используйте `--true-unlimited*`: первый запуск автоматически патчит Hiddify и перезапускает сервисы.
 
 Можно использовать короткий алиас:
 
@@ -116,7 +138,7 @@ psasctl u list
 - Быстрый выбор: клавиши `1-9` и hotkeys у пунктов меню.
 - Пункт `Flag command wizard` пошагово собирает стандартные команды (`status/users/config/apply`) и запускает их через тот же CLI, сохраняя оригинальную обработку флагов.
 - В `Show user`/`Delete user` есть picker пользователей: стрелки, фильтр набором текста, `Backspace`, ручной ввод по `i`.
-- В `Add user` режим тарифа (`no_reset|daily|weekly|monthly`) выбирается стрелками, числовые поля валидируются с повторным запросом.
+- В `Add user` режим тарифа (`no_reset|daily|weekly|monthly`) выбирается стрелками, есть опции безлимита по трафику и/или времени.
 - Все флаговые команды продолжают работать как раньше.
 
 Переменные окружения:

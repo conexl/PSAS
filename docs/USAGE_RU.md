@@ -15,6 +15,7 @@ sudo ./psas-install.sh
 
 ```bash
 hiddify-sub add --name user01 --days 30 --gb 300 --mode no_reset
+hiddify-sub edit user01 --subscription-name "User01 iPhone"
 ```
 
 3. Взять ссылку `/auto/` и импортировать в Hiddify.
@@ -34,6 +35,13 @@ psasctl ui
 psasctl users list
 psasctl users list --enabled
 psasctl users find ivan
+psasctl users add --name ivan --days 30 --gb 300 --mode no_reset
+psasctl users add --subscription-name "Ivan iPhone" --days 30 --gb 300 --mode no_reset
+psasctl users add --name ivan --unlimited --mode no_reset
+psasctl users add --name ivan --true-unlimited --mode no_reset
+psasctl users add --name ivan --unlimited-gb --unlimited-days --mode no_reset
+psasctl users edit ivan --days 60 --gb 500 --mode monthly
+psasctl users edit ivan --subscription-name "Ivan Main" --true-unlimited-gb
 psasctl users show <USER_ID>
 psasctl users links <USER_ID>
 psasctl users del <USER_ID>
@@ -41,12 +49,19 @@ psasctl users del <USER_ID>
 # Конфиг
 psasctl config get hysteria_enable
 psasctl config set hysteria_enable true
+psasctl protocols list
+psasctl protocols enable hysteria2
+psasctl protocols disable --apply tuic vmess
 
 # Применить безопасно
 psasctl apply
 # или
 hiddify-apply-safe <your-domain>
 ```
+
+Примечание:
+- `--subscription-name` и `--name` для пользователя эквивалентны (в Hiddify это одно поле).
+- Для настоящего безлимита используйте `--true-unlimited*`: первый запуск автоматически патчит Hiddify и перезапускает сервисы.
 
 ## Примечание по UUID
 
@@ -65,7 +80,7 @@ hiddify-apply-safe <your-domain>
 - быстрый выбор по номеру (`1-9`) и hotkeys пунктов,
 - есть `Flag command wizard`: пошаговая сборка стандартных команд (`status/users/config/apply`) с запуском через тот же `psasctl`, чтобы сохранить исходную обработку флагов,
 - в операциях `Show/Delete` есть стрелочный выбор пользователя с фильтром по вводу и ручным вводом `USER_ID`,
-- в `Add user` режим (`no_reset|daily|weekly|monthly`) выбирается стрелками, числовые поля перепрашиваются до корректного значения,
+- в `Add user` режим (`no_reset|daily|weekly|monthly`) выбирается стрелками, есть опции безлимита по трафику и/или времени,
 - для операций с параметрами утилита запросит нужные поля по шагам,
 - просмотр статуса и URL админки,
 - список/поиск пользователей,
