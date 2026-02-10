@@ -6,7 +6,8 @@ PSAS (Personal Secure Auto Setup) — набор инструментов для
 - `install/psas-install.sh` — интерактивный авто-установщик и hardening.
 - `hiddify-sub` (устанавливается скриптом) — простой CLI для пользователей/подписок.
 - `hiddify-apply-safe` (устанавливается скриптом) — безопасное применение конфигов с финальной синхронизацией LE-сертификата.
-- `cmd/psasctl` — Go CLI для управления Hiddify.
+- `trusttunnel-sub` (устанавливается скриптом) — thin-wrapper для `psasctl trust`.
+- `cmd/psasctl` — Go CLI для управления Hiddify и TrustTunnel.
 
 ## 1) Быстрый старт
 
@@ -40,9 +41,11 @@ sudo ./psas-install.sh
 - Устанавливает вспомогательные команды:
   - `/usr/local/bin/hiddify-sub`
   - `/usr/local/bin/hiddify-apply-safe`
+  - `/usr/local/bin/trusttunnel-sub`
   - `/usr/local/sbin/sync-hiddify-cert.sh`
 - Настраивает cron на синхронизацию LE-сертификата в Hiddify:
   - `/etc/cron.d/sync-hiddify-cert`
+- Опционально устанавливает и настраивает TrustTunnel (`/opt/trusttunnel`) на отдельном порту (по умолчанию `8443`) с отдельными пользователями.
 
 ## 3) Админ-панель
 
@@ -120,6 +123,28 @@ psasctl protocols enable hysteria2
 psasctl protocols disable --apply tuic vmess
 
 psasctl apply
+
+# TrustTunnel
+psasctl trust status
+psasctl trust users list
+psasctl trust users add --name tt-user01 --show-config
+psasctl trust users show tt-user01 --show-config
+psasctl trust users edit tt-user01 --password 'newStrongPass'
+psasctl trust users del tt-user01
+psasctl trust users config tt-user01 --out /root/tt-user01.toml
+psasctl trust service restart
+psasctl trust ui
+
+# SOCKS5 (Dante)
+psasctl socks status
+psasctl socks users list
+psasctl socks users add --name socks01 --show-config --server vpn.example.com
+psasctl socks users show --show-config --server vpn.example.com socks01
+psasctl socks users edit socks01 --password 'newStrongPass'
+psasctl socks users del socks01
+psasctl socks users config --server vpn.example.com socks01
+psasctl socks service restart
+psasctl socks ui
 ```
 
 Примечания:
@@ -136,7 +161,9 @@ psasctl u list
 - `psasctl ui` (или `psasctl menu`) открывает clean-screen меню в терминале.
 - Навигация: `↑/↓` (или `j/k`), выбор `Enter`, выход `q`.
 - Быстрый выбор: клавиши `1-9` и hotkeys у пунктов меню.
-- Пункт `Flag command wizard` пошагово собирает стандартные команды (`status/users/config/apply`) и запускает их через тот же CLI, сохраняя оригинальную обработку флагов.
+- Пункт `Flag command wizard` пошагово собирает стандартные команды (`status/users/config/apply/trust/socks`) и запускает их через тот же CLI, сохраняя оригинальную обработку флагов.
+- Для TrustTunnel добавлен отдельный пункт `TrustTunnel` (status/list/add/edit/show/delete/service).
+- Для SOCKS5 добавлен отдельный пункт `SOCKS5 (Dante)` (status/list/add/edit/show/delete/service).
 - В `Show user`/`Delete user` есть picker пользователей: стрелки, фильтр набором текста, `Backspace`, ручной ввод по `i`.
 - В `Add user` режим тарифа (`no_reset|daily|weekly|monthly`) выбирается стрелками, есть опции безлимита по трафику и/или времени.
 - Все флаговые команды продолжают работать как раньше.
@@ -145,6 +172,10 @@ psasctl u list
 - `PSAS_PANEL_CFG` (default `/opt/hiddify-manager/hiddify-panel/app.cfg`)
 - `PSAS_PANEL_ADDR` (default `http://127.0.0.1:9000`)
 - `PSAS_PANEL_PY` (default auto detect)
+- `PSAS_SOCKS_SERVICE` (default `danted`)
+- `PSAS_SOCKS_CONF` (default `/etc/danted.conf`)
+- `PSAS_SOCKS_USERS` (default `/etc/psas/socks-users.json`)
+- `PSAS_SOCKS_HOST` (override host in generated SOCKS config)
 
 ## 6) Безопасное применение конфигов
 

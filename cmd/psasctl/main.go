@@ -9,7 +9,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +27,13 @@ import (
 const (
 	defaultPanelCfg      = "/opt/hiddify-manager/hiddify-panel/app.cfg"
 	defaultPanelAddr     = "http://127.0.0.1:9000"
+	defaultTrustDir      = "/opt/trusttunnel"
+	defaultTrustService  = "trusttunnel"
+	defaultTrustEndpoint = "trusttunnel_endpoint"
+	defaultSocksService  = "danted"
+	defaultSocksConfig   = "/etc/danted.conf"
+	defaultSocksUsers    = "/etc/psas/socks-users.json"
+	defaultSocksPort     = 1080
 	unlimitedPackageDays = 10000
 	unlimitedUsageGB     = 1000000.0
 )
@@ -71,6 +80,56 @@ type client struct {
 	state     state
 }
 
+type trustClient struct {
+	dir               string
+	service           string
+	lastExportAddress string
+}
+
+type trustUser struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type trustStatus struct {
+	Installed     bool   `json:"installed"`
+	Service       string `json:"service"`
+	ServiceActive bool   `json:"service_active"`
+	Directory     string `json:"directory"`
+	ListenAddress string `json:"listen_address,omitempty"`
+	Hostname      string `json:"hostname,omitempty"`
+	Users         int    `json:"users"`
+}
+
+type socksClient struct {
+	service string
+	config  string
+	users   string
+}
+
+type socksUser struct {
+	Name       string `json:"name"`
+	Password   string `json:"password"`
+	SystemUser string `json:"system_user,omitempty"`
+}
+
+type socksStatus struct {
+	Installed     bool   `json:"installed"`
+	Service       string `json:"service"`
+	ServiceActive bool   `json:"service_active"`
+	ConfigPath    string `json:"config_path"`
+	ListenAddress string `json:"listen_address,omitempty"`
+	Users         int    `json:"users"`
+}
+
+type socksConnInfo struct {
+	Server   string `json:"server"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	URI      string `json:"uri"`
+}
+
 type protocolSetting struct {
 	Name    string
 	Key     string
@@ -100,6 +159,9 @@ var protocolSettings = []protocolSetting{
 }
 
 var uuidRe = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
+var trustUserRe = regexp.MustCompile(`^[A-Za-z0-9._@-]{1,64}$`)
+var socksUserRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,30}$`)
+var dantedInternalRe = regexp.MustCompile(`(?i)^internal:\s*([^\s]+)(?:\s+port\s*=\s*([0-9]{1,5}))?\s*$`)
 var ansiRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 var errUISelectionCanceled = errors.New("selection canceled")
 var errUIExitRequested = errors.New("exit requested")
@@ -131,6 +193,10 @@ func main() {
 		runConfig(args)
 	case "apply":
 		runApply(args)
+	case "trust", "trusttunnel", "tt":
+		runTrust(args)
+	case "socks", "socks5":
+		runSocks(args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -160,6 +226,24 @@ Usage:
   psasctl config get <key>
   psasctl config set <key> <value>
   psasctl apply
+  psasctl trust status [--json]
+  psasctl trust users list [--json]
+  psasctl trust users add --name NAME [--password PASS] [--address IP:PORT] [--show-config] [--json]
+  psasctl trust users edit [--name NAME] [--password PASS] [--json] <USER_ID>
+  psasctl trust users show [--address IP:PORT] [--show-config] [--json] <USER_ID>
+  psasctl trust users config [--address IP:PORT] [--out FILE] [--json] <USER_ID>
+  psasctl trust users del <USER_ID>
+  psasctl trust service <status|start|stop|restart>
+  psasctl trust ui
+  psasctl socks status [--json]
+  psasctl socks users list [--json]
+  psasctl socks users add --name LOGIN [--password PASS] [--server HOST] [--port N] [--show-config] [--json]
+  psasctl socks users edit [--name LOGIN] [--password PASS] [--json] <USER_ID>
+  psasctl socks users show [--server HOST] [--port N] [--show-config] [--json] <USER_ID>
+  psasctl socks users config [--server HOST] [--port N] [--out FILE] [--json] <USER_ID>
+  psasctl socks users del <USER_ID>
+  psasctl socks service <status|start|stop|restart>
+  psasctl socks ui
 
 USER_ID can be UUID or user name (exact/substring match).
 
@@ -167,6 +251,12 @@ Environment overrides:
   PSAS_PANEL_CFG   (default /opt/hiddify-manager/hiddify-panel/app.cfg)
   PSAS_PANEL_ADDR  (default http://127.0.0.1:9000)
   PSAS_PANEL_PY    (default auto-detect .venv313/.venv/python3)
+  PSAS_TT_DIR      (default /opt/trusttunnel)
+  PSAS_TT_SERVICE  (default trusttunnel)
+  PSAS_SOCKS_SERVICE (default danted)
+  PSAS_SOCKS_CONF    (default /etc/danted.conf)
+  PSAS_SOCKS_USERS   (default /etc/psas/socks-users.json)
+  PSAS_SOCKS_HOST    (override default server host in config output)
 `)
 }
 
@@ -177,7 +267,7 @@ func runStatus(args []string) {
 	if len(fs.Args()) != 0 {
 		fatalf("status takes no positional args")
 	}
-	c := mustClient(true)
+	c := mustClient(false)
 	mainDomain := c.mainDomain()
 	cfg := c.currentConfig()
 
@@ -190,6 +280,12 @@ func runStatus(args []string) {
 		"hysteria_base_port": cfg["hysteria_port"],
 		"reality_sni":        cfg["reality_server_names"],
 		"users":              len(c.state.Users),
+	}
+	if tt, err := newTrustClient().status(); err == nil {
+		out["trusttunnel"] = tt
+	}
+	if sc, err := newSocksClient().status(); err == nil {
+		out["socks5"] = sc
 	}
 	if *jsonOut {
 		printJSON(out)
@@ -204,6 +300,22 @@ func runStatus(args []string) {
 	fmt.Printf("Hysteria base port: %v\n", cfg["hysteria_port"])
 	fmt.Printf("Reality SNI: %v\n", cfg["reality_server_names"])
 	fmt.Printf("Users: %d\n", len(c.state.Users))
+	if tt, err := newTrustClient().status(); err == nil {
+		fmt.Printf("TrustTunnel installed: %t\n", tt.Installed)
+		if tt.Installed {
+			fmt.Printf("TrustTunnel service active: %t\n", tt.ServiceActive)
+			fmt.Printf("TrustTunnel listen: %s\n", tt.ListenAddress)
+			fmt.Printf("TrustTunnel users: %d\n", tt.Users)
+		}
+	}
+	if sc, err := newSocksClient().status(); err == nil {
+		fmt.Printf("SOCKS5 installed: %t\n", sc.Installed)
+		if sc.Installed {
+			fmt.Printf("SOCKS5 service active: %t\n", sc.ServiceActive)
+			fmt.Printf("SOCKS5 listen: %s\n", sc.ListenAddress)
+			fmt.Printf("SOCKS5 users: %d\n", sc.Users)
+		}
+	}
 }
 
 func runAdminURL(args []string) {
@@ -590,6 +702,743 @@ func runProtocols(args []string) {
 	}
 }
 
+func runTrust(args []string) {
+	if len(args) < 1 {
+		fatalf("trust requires subcommand: status|users|service|ui")
+	}
+
+	tt := newTrustClient()
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	subArgs := args[1:]
+
+	switch sub {
+	case "status":
+		fs := flag.NewFlagSet("trust status", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("trust status takes no positional args")
+		}
+		st, err := tt.status()
+		must(err)
+		if *jsonOut {
+			printJSON(st)
+			return
+		}
+		printTrustStatus(st)
+	case "users", "user", "u":
+		runTrustUsers(tt, subArgs)
+	case "service", "svc":
+		runTrustService(tt, subArgs)
+	case "ui", "menu", "interactive":
+		runTrustUI(subArgs)
+	default:
+		fatalf("unknown trust subcommand: %s", sub)
+	}
+}
+
+func runSocks(args []string) {
+	if len(args) < 1 {
+		fatalf("socks requires subcommand: status|users|service|ui")
+	}
+
+	sc := newSocksClient()
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	subArgs := args[1:]
+
+	switch sub {
+	case "status":
+		fs := flag.NewFlagSet("socks status", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("socks status takes no positional args")
+		}
+		st, err := sc.status()
+		must(err)
+		if *jsonOut {
+			printJSON(st)
+			return
+		}
+		printSocksStatus(st)
+	case "users", "user", "u":
+		runSocksUsers(sc, subArgs)
+	case "service", "svc":
+		runSocksService(sc, subArgs)
+	case "ui", "menu", "interactive":
+		runSocksUI(subArgs)
+	default:
+		fatalf("unknown socks subcommand: %s", sub)
+	}
+}
+
+func runSocksUsers(sc *socksClient, args []string) {
+	if len(args) < 1 {
+		fatalf("socks users requires subcommand: list|add|edit|show|config|del")
+	}
+
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	subArgs := args[1:]
+
+	switch sub {
+	case "list", "ls":
+		fs := flag.NewFlagSet("socks users list", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("socks users list takes no positional args")
+		}
+		users, err := sc.usersList()
+		must(err)
+		if *jsonOut {
+			printJSON(users)
+			return
+		}
+		printSocksUsers(users)
+	case "add":
+		fs := flag.NewFlagSet("socks users add", flag.ExitOnError)
+		name := fs.String("name", "", "login")
+		password := fs.String("password", "", "password (empty = auto-generated)")
+		server := fs.String("server", "", "server host/ip for generated config")
+		port := fs.Int("port", 0, "server port for generated config (default: danted port)")
+		showConfig := fs.Bool("show-config", false, "also print generated socks config")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("socks users add takes only flags")
+		}
+		must(requireRoot("socks users add"))
+
+		login := normalizeSocksLogin(*name)
+		if err := validateSocksLogin(login); err != nil {
+			fatalf("%v", err)
+		}
+
+		users, err := sc.usersList()
+		must(err)
+		if hasSocksUserExact(users, login) {
+			fatalf("socks user already exists: %s", login)
+		}
+		if osSocksUserExists(login) {
+			fatalf("linux user already exists: %s", login)
+		}
+
+		pass := strings.TrimSpace(*password)
+		if pass == "" {
+			pass = newSecureToken(24)
+		}
+
+		must(sc.ensureLinuxUser(login, pass))
+		users = append(users, socksUser{Name: login, Password: pass, SystemUser: login})
+		must(sc.writeUsers(users))
+
+		resp := map[string]any{
+			"user": map[string]any{
+				"name":        login,
+				"password":    pass,
+				"system_user": login,
+			},
+		}
+		if *showConfig {
+			cfg, err := sc.connectionConfig(socksUser{Name: login, Password: pass, SystemUser: login}, strings.TrimSpace(*server), *port)
+			if err != nil {
+				fatalf("user was added, but failed to build socks config: %v", err)
+			}
+			resp["config"] = cfg
+		}
+		if *jsonOut {
+			printJSON(resp)
+			return
+		}
+
+		fmt.Printf("SOCKS user added: %s\n", login)
+		fmt.Printf("Password: %s\n", pass)
+		if *showConfig {
+			cfgAny := resp["config"]
+			if cfg, ok := cfgAny.(socksConnInfo); ok {
+				printSocksConnInfo(cfg)
+			}
+		}
+	case "edit":
+		fs := flag.NewFlagSet("socks users edit", flag.ExitOnError)
+		name := fs.String("name", "", "new login")
+		password := fs.String("password", "", "new password")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("socks users edit requires USER_ID")
+		}
+		must(requireRoot("socks users edit"))
+
+		users, err := sc.usersList()
+		must(err)
+		current, idx, err := resolveSocksUser(users, rest[0])
+		must(err)
+
+		target := current
+		newName := normalizeSocksLogin(*name)
+		newPass := strings.TrimSpace(*password)
+		oldSystemUser := socksSystemUser(current)
+
+		if newName == "" && newPass == "" {
+			fatalf("socks users edit: no changes requested")
+		}
+		if newName != "" && newName != current.Name {
+			if err := validateSocksLogin(newName); err != nil {
+				fatalf("%v", err)
+			}
+			for i, u := range users {
+				if i == idx {
+					continue
+				}
+				if strings.EqualFold(strings.TrimSpace(u.Name), newName) {
+					fatalf("socks user already exists: %s", newName)
+				}
+			}
+			if osSocksUserExists(newName) {
+				fatalf("linux user already exists: %s", newName)
+			}
+			must(runCommand("usermod", "-l", newName, oldSystemUser))
+			target.Name = newName
+			target.SystemUser = newName
+		}
+		if newPass != "" {
+			must(sc.setLinuxUserPassword(socksSystemUser(target), newPass))
+			target.Password = newPass
+		}
+
+		users[idx] = target
+		must(sc.writeUsers(users))
+
+		if *jsonOut {
+			printJSON(map[string]any{
+				"user_before": current,
+				"user_after":  target,
+			})
+			return
+		}
+		fmt.Printf("SOCKS user updated: %s -> %s\n", current.Name, target.Name)
+		if newPass != "" {
+			fmt.Printf("New password: %s\n", newPass)
+		}
+	case "show":
+		fs := flag.NewFlagSet("socks users show", flag.ExitOnError)
+		server := fs.String("server", "", "server host/ip for generated config")
+		port := fs.Int("port", 0, "server port for generated config")
+		showConfig := fs.Bool("show-config", false, "also print generated socks config")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("socks users show requires USER_ID")
+		}
+
+		users, err := sc.usersList()
+		must(err)
+		u, _, err := resolveSocksUser(users, rest[0])
+		must(err)
+
+		out := map[string]any{"user": u}
+		if *showConfig {
+			cfg, err := sc.connectionConfig(u, strings.TrimSpace(*server), *port)
+			if err != nil {
+				fatalf("failed to build socks config: %v", err)
+			}
+			out["config"] = cfg
+		}
+		if *jsonOut {
+			printJSON(out)
+			return
+		}
+		printSocksUser(u)
+		if *showConfig {
+			fmt.Println()
+			if cfg, ok := out["config"].(socksConnInfo); ok {
+				printSocksConnInfo(cfg)
+			}
+		}
+	case "config":
+		fs := flag.NewFlagSet("socks users config", flag.ExitOnError)
+		server := fs.String("server", "", "server host/ip for generated config")
+		port := fs.Int("port", 0, "server port for generated config")
+		outPath := fs.String("out", "", "write socks config to file")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("socks users config requires USER_ID")
+		}
+
+		users, err := sc.usersList()
+		must(err)
+		u, _, err := resolveSocksUser(users, rest[0])
+		must(err)
+		cfg, err := sc.connectionConfig(u, strings.TrimSpace(*server), *port)
+		must(err)
+
+		if p := strings.TrimSpace(*outPath); p != "" {
+			must(os.WriteFile(p, []byte(renderSocksConnInfo(cfg)), 0o600))
+		}
+
+		if *jsonOut {
+			printJSON(map[string]any{
+				"user":   u,
+				"config": cfg,
+				"out":    strings.TrimSpace(*outPath),
+			})
+			return
+		}
+		printSocksConnInfo(cfg)
+		if p := strings.TrimSpace(*outPath); p != "" {
+			fmt.Printf("Saved to: %s\n", p)
+		}
+	case "del", "delete", "rm":
+		if len(subArgs) != 1 {
+			fatalf("socks users del requires USER_ID")
+		}
+		must(requireRoot("socks users del"))
+
+		users, err := sc.usersList()
+		must(err)
+		u, idx, err := resolveSocksUser(users, subArgs[0])
+		must(err)
+		next := make([]socksUser, 0, len(users)-1)
+		next = append(next, users[:idx]...)
+		next = append(next, users[idx+1:]...)
+		must(sc.writeUsers(next))
+
+		warn := ""
+		if err := sc.deleteLinuxUser(socksSystemUser(u)); err != nil {
+			warn = err.Error()
+		}
+		fmt.Printf("SOCKS user deleted: %s\n", u.Name)
+		if warn != "" {
+			fmt.Printf("Warning: %s\n", warn)
+		}
+	default:
+		fatalf("unknown socks users subcommand: %s", sub)
+	}
+}
+
+func runSocksService(sc *socksClient, args []string) {
+	if len(args) != 1 {
+		fatalf("socks service requires action: status|start|stop|restart")
+	}
+	action := strings.ToLower(strings.TrimSpace(args[0]))
+	switch action {
+	case "status":
+		must(runCommand("systemctl", "--no-pager", "--full", "status", sc.service))
+	case "start", "stop", "restart":
+		must(runCommand("systemctl", action, sc.service))
+		fmt.Printf("SOCKS service %s: %s\n", action, sc.service)
+	default:
+		fatalf("unknown socks service action: %s (expected status|start|stop|restart)", action)
+	}
+}
+
+func runSocksUI(args []string) {
+	if len(args) != 0 {
+		fatalf("socks ui takes no args")
+	}
+	if !isInteractiveTerminal() {
+		fatalf("socks ui requires an interactive terminal")
+	}
+	in := bufio.NewReader(os.Stdin)
+	clearScreen()
+	printBoxedHeader("SOCKS5 (Dante)")
+	if err := uiSocksProxy(in); err != nil {
+		if errors.Is(err, errUISelectionCanceled) || errors.Is(err, errUIExitRequested) || errors.Is(err, io.EOF) {
+			clearScreen()
+			return
+		}
+		fatalf("socks ui error: %v", err)
+	}
+	clearScreen()
+}
+
+func runTrustUsers(tt *trustClient, args []string) {
+	if len(args) < 1 {
+		fatalf("trust users requires subcommand: list|add|edit|show|config|del")
+	}
+
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	subArgs := args[1:]
+
+	switch sub {
+	case "list", "ls":
+		fs := flag.NewFlagSet("trust users list", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("trust users list takes no positional args")
+		}
+		users, err := tt.usersList()
+		must(err)
+		if *jsonOut {
+			printJSON(users)
+			return
+		}
+		printTrustUsers(users)
+	case "add":
+		fs := flag.NewFlagSet("trust users add", flag.ExitOnError)
+		name := fs.String("name", "", "username")
+		password := fs.String("password", "", "password (empty = auto-generated)")
+		address := fs.String("address", "", "endpoint address ip[:port] for generated config")
+		showConfig := fs.Bool("show-config", false, "also print generated client config")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("trust users add takes only flags")
+		}
+
+		username := strings.TrimSpace(*name)
+		if err := validateTrustUsername(username); err != nil {
+			fatalf("%v", err)
+		}
+
+		users, err := tt.usersList()
+		must(err)
+		if hasTrustUserExact(users, username) {
+			fatalf("trust user already exists: %s", username)
+		}
+
+		pass := strings.TrimSpace(*password)
+		if pass == "" {
+			pass = newSecureToken(24)
+		}
+
+		users = append(users, trustUser{Username: username, Password: pass})
+		must(tt.writeUsers(users))
+		restartWarn := trustRestartWarning(tt.service, tt.restartService())
+
+		resp := map[string]any{
+			"user": map[string]any{
+				"username": username,
+				"password": pass,
+			},
+		}
+		if restartWarn != "" {
+			resp["restart_warning"] = restartWarn
+		}
+
+		if *showConfig {
+			configText, err := tt.exportClientConfig(username, strings.TrimSpace(*address))
+			if err != nil {
+				fatalf("user was added, but failed to export client config: %v", err)
+			}
+			resp["client_config"] = configText
+			resp["address"] = tt.lastExportAddress
+		}
+
+		if *jsonOut {
+			printJSON(resp)
+			return
+		}
+
+		fmt.Printf("TrustTunnel user added: %s\n", username)
+		fmt.Printf("Password: %s\n", pass)
+		if restartWarn != "" {
+			fmt.Printf("Warning: %s\n", restartWarn)
+		}
+		if *showConfig {
+			fmt.Println()
+			fmt.Println("Client config")
+			fmt.Println("=============")
+			fmt.Println(resp["client_config"])
+		}
+	case "edit", "update", "set":
+		fs := flag.NewFlagSet("trust users edit", flag.ExitOnError)
+		name := fs.String("name", "", "new username")
+		password := fs.String("password", "", "new password")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("trust users edit requires USER_ID")
+		}
+
+		users, err := tt.usersList()
+		must(err)
+		current, idx, err := resolveTrustUser(users, rest[0])
+		must(err)
+
+		newName := strings.TrimSpace(*name)
+		newPassword := strings.TrimSpace(*password)
+		if newName == "" && newPassword == "" {
+			fatalf("trust users edit: no changes requested")
+		}
+		if newName != "" {
+			if err := validateTrustUsername(newName); err != nil {
+				fatalf("%v", err)
+			}
+			for i, u := range users {
+				if i == idx {
+					continue
+				}
+				if strings.EqualFold(strings.TrimSpace(u.Username), newName) {
+					fatalf("trust user already exists: %s", newName)
+				}
+			}
+			users[idx].Username = newName
+		}
+		if newPassword != "" {
+			users[idx].Password = newPassword
+		}
+
+		must(tt.writeUsers(users))
+		restartWarn := trustRestartWarning(tt.service, tt.restartService())
+
+		out := map[string]any{
+			"before": current,
+			"after":  users[idx],
+		}
+		if restartWarn != "" {
+			out["restart_warning"] = restartWarn
+		}
+		if *jsonOut {
+			printJSON(out)
+			return
+		}
+		fmt.Printf("TrustTunnel user updated: %s -> %s\n", current.Username, users[idx].Username)
+		if restartWarn != "" {
+			fmt.Printf("Warning: %s\n", restartWarn)
+		}
+	case "show":
+		fs := flag.NewFlagSet("trust users show", flag.ExitOnError)
+		address := fs.String("address", "", "endpoint address ip[:port] for generated config")
+		showConfig := fs.Bool("show-config", false, "also print generated client config")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("trust users show requires USER_ID")
+		}
+
+		users, err := tt.usersList()
+		must(err)
+		u, _, err := resolveTrustUser(users, rest[0])
+		must(err)
+
+		out := map[string]any{
+			"user": u,
+		}
+		if *showConfig {
+			configText, err := tt.exportClientConfig(u.Username, strings.TrimSpace(*address))
+			if err != nil {
+				fatalf("failed to export client config: %v", err)
+			}
+			out["client_config"] = configText
+			out["address"] = tt.lastExportAddress
+		}
+		if *jsonOut {
+			printJSON(out)
+			return
+		}
+		printTrustUser(u)
+		if *showConfig {
+			fmt.Println()
+			fmt.Println("Client config")
+			fmt.Println("=============")
+			fmt.Println(out["client_config"])
+		}
+	case "config":
+		fs := flag.NewFlagSet("trust users config", flag.ExitOnError)
+		address := fs.String("address", "", "endpoint address ip[:port] for generated config")
+		outPath := fs.String("out", "", "write client config to file")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("trust users config requires USER_ID")
+		}
+
+		users, err := tt.usersList()
+		must(err)
+		u, _, err := resolveTrustUser(users, rest[0])
+		must(err)
+
+		configText, err := tt.exportClientConfig(u.Username, strings.TrimSpace(*address))
+		must(err)
+
+		if p := strings.TrimSpace(*outPath); p != "" {
+			must(os.WriteFile(p, []byte(configText), 0o600))
+		}
+
+		if *jsonOut {
+			printJSON(map[string]any{
+				"user":    u,
+				"address": tt.lastExportAddress,
+				"config":  configText,
+				"out":     strings.TrimSpace(*outPath),
+			})
+			return
+		}
+		fmt.Printf("Generated TrustTunnel config for %s\n", u.Username)
+		fmt.Printf("Address: %s\n", tt.lastExportAddress)
+		if p := strings.TrimSpace(*outPath); p != "" {
+			fmt.Printf("Saved to: %s\n", p)
+			return
+		}
+		fmt.Println()
+		fmt.Println(configText)
+	case "del", "delete", "rm":
+		if len(subArgs) != 1 {
+			fatalf("trust users del requires USER_ID")
+		}
+
+		users, err := tt.usersList()
+		must(err)
+		u, idx, err := resolveTrustUser(users, subArgs[0])
+		must(err)
+
+		next := make([]trustUser, 0, len(users)-1)
+		next = append(next, users[:idx]...)
+		next = append(next, users[idx+1:]...)
+		must(tt.writeUsers(next))
+		restartWarn := trustRestartWarning(tt.service, tt.restartService())
+
+		fmt.Printf("TrustTunnel user deleted: %s\n", u.Username)
+		if restartWarn != "" {
+			fmt.Printf("Warning: %s\n", restartWarn)
+		}
+	default:
+		fatalf("unknown trust users subcommand: %s", sub)
+	}
+}
+
+func runTrustService(tt *trustClient, args []string) {
+	if len(args) != 1 {
+		fatalf("trust service requires action: status|start|stop|restart")
+	}
+	action := strings.ToLower(strings.TrimSpace(args[0]))
+	switch action {
+	case "status":
+		must(runCommand("systemctl", "--no-pager", "--full", "status", tt.service))
+	case "start", "stop", "restart":
+		must(runCommand("systemctl", action, tt.service))
+		fmt.Printf("TrustTunnel service %s: %s\n", action, tt.service)
+	default:
+		fatalf("unknown trust service action: %s (expected status|start|stop|restart)", action)
+	}
+}
+
+func runTrustUI(args []string) {
+	if len(args) != 0 {
+		fatalf("trust ui takes no args")
+	}
+	if !isInteractiveTerminal() {
+		fatalf("trust ui requires an interactive terminal")
+	}
+
+	in := bufio.NewReader(os.Stdin)
+	clearScreen()
+	printBoxedHeader("TrustTunnel")
+	if err := uiTrustTunnel(in); err != nil {
+		if errors.Is(err, errUISelectionCanceled) || errors.Is(err, errUIExitRequested) {
+			clearScreen()
+			return
+		}
+		if errors.Is(err, io.EOF) {
+			clearScreen()
+			return
+		}
+		fatalf("trust ui error: %v", err)
+	}
+	clearScreen()
+}
+
+func printTrustStatus(st trustStatus) {
+	fmt.Printf("TrustTunnel installed: %t\n", st.Installed)
+	fmt.Printf("Service: %s (active=%t)\n", st.Service, st.ServiceActive)
+	fmt.Printf("Directory: %s\n", st.Directory)
+	if st.ListenAddress != "" {
+		fmt.Printf("Listen: %s\n", st.ListenAddress)
+	}
+	if st.Hostname != "" {
+		fmt.Printf("Hostname: %s\n", st.Hostname)
+	}
+	fmt.Printf("Users: %d\n", st.Users)
+}
+
+func printTrustUsers(users []trustUser) {
+	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "USERNAME\tPASSWORD")
+	for _, u := range users {
+		fmt.Fprintf(tw, "%s\t%s\n", u.Username, maskSecret(u.Password))
+	}
+	_ = tw.Flush()
+}
+
+func printTrustUser(u trustUser) {
+	fmt.Println()
+	fmt.Println("TrustTunnel User")
+	fmt.Println("================")
+	fmt.Printf("Username: %s\n", u.Username)
+	fmt.Printf("Password: %s\n", u.Password)
+}
+
+func printSocksStatus(st socksStatus) {
+	fmt.Printf("SOCKS installed: %t\n", st.Installed)
+	fmt.Printf("Service: %s (active=%t)\n", st.Service, st.ServiceActive)
+	fmt.Printf("Config: %s\n", st.ConfigPath)
+	if st.ListenAddress != "" {
+		fmt.Printf("Listen: %s\n", st.ListenAddress)
+	}
+	fmt.Printf("Users: %d\n", st.Users)
+}
+
+func printSocksUsers(users []socksUser) {
+	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "LOGIN\tPASSWORD")
+	for _, u := range users {
+		fmt.Fprintf(tw, "%s\t%s\n", u.Name, maskSecret(u.Password))
+	}
+	_ = tw.Flush()
+}
+
+func printSocksUser(u socksUser) {
+	fmt.Println()
+	fmt.Println("SOCKS User")
+	fmt.Println("==========")
+	fmt.Printf("Login: %s\n", u.Name)
+	fmt.Printf("Password: %s\n", u.Password)
+}
+
+func renderSocksConnInfo(cfg socksConnInfo) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Server: %s\n", cfg.Server)
+	fmt.Fprintf(&b, "Port: %d\n", cfg.Port)
+	fmt.Fprintf(&b, "Login: %s\n", cfg.Username)
+	fmt.Fprintf(&b, "Password: %s\n", cfg.Password)
+	fmt.Fprintf(&b, "URI: %s\n", cfg.URI)
+	return b.String()
+}
+
+func printSocksConnInfo(cfg socksConnInfo) {
+	fmt.Println("SOCKS5 config")
+	fmt.Println("=============")
+	fmt.Print(renderSocksConnInfo(cfg))
+}
+
+func maskSecret(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if len(s) <= 4 {
+		return strings.Repeat("*", len(s))
+	}
+	return s[:2] + strings.Repeat("*", len(s)-4) + s[len(s)-2:]
+}
+
+func trustRestartWarning(service string, err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf("credentials saved, but failed to restart %s: %v", service, err)
+}
+
 func protocolStates(cfg map[string]any) []protocolState {
 	out := make([]protocolState, 0, len(protocolSettings))
 	for _, p := range protocolSettings {
@@ -718,6 +1567,8 @@ func runUI(args []string) {
 		{Key: "add", Shortcut: 'a', Title: "Add user", Hint: "Step-by-step wizard for creating a user"},
 		{Key: "edit", Shortcut: 'e', Title: "Edit user", Hint: "Pick a user and edit name/limits/mode/enabled state"},
 		{Key: "delete", Shortcut: 'd', Title: "Delete user", Hint: "Pick a user and delete with confirmation"},
+		{Key: "socks", Shortcut: 'k', Title: "SOCKS5 (Dante)", Hint: "Manage SOCKS users and danted service"},
+		{Key: "trust", Shortcut: 'r', Title: "TrustTunnel", Hint: "Manage TrustTunnel users and service"},
 		{Key: "protocols", Shortcut: 't', Title: "Protocols", Hint: "List and toggle protocol enable flags"},
 		{Key: "admin", Shortcut: 'u', Title: "Admin URL", Hint: "Print panel admin URL"},
 		{Key: "apply", Shortcut: 'p', Title: "Apply config", Hint: "Run hiddify-apply-safe or panel apply"},
@@ -728,6 +1579,10 @@ func runUI(args []string) {
 	for {
 		choice, err := uiSelectMenuItem(menuItems, in)
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				clearScreen()
+				return
+			}
 			fatalf("ui input error: %v", err)
 		}
 		if choice.Key == "exit" {
@@ -739,6 +1594,7 @@ func runUI(args []string) {
 		printBoxedHeader(choice.Title)
 
 		var actionErr error
+		handledPause := false
 		switch choice.Key {
 		case "status":
 			actionErr = uiStatus(c)
@@ -754,12 +1610,22 @@ func runUI(args []string) {
 			actionErr = uiEditUser(c, in)
 		case "delete":
 			actionErr = uiDeleteUser(c, in)
+		case "socks":
+			actionErr = uiSocksProxy(in)
+			handledPause = true
+		case "trust":
+			actionErr = uiTrustTunnel(in)
+			handledPause = true
 		case "protocols":
 			actionErr = uiProtocols(c, in)
 		case "admin":
 			actionErr = uiAdminURL(c)
 		case "apply":
-			actionErr = applyWithClient(c)
+			if err := ensureHiddifyStateLoaded(c); err != nil {
+				actionErr = err
+			} else {
+				actionErr = applyWithClient(c)
+			}
 		case "wizard":
 			actionErr = uiRunFlagWizard(c, in)
 		default:
@@ -777,8 +1643,15 @@ func runUI(args []string) {
 				fmt.Printf("\nERROR: %v\n", actionErr)
 			}
 		}
+		if handledPause {
+			continue
+		}
 		if err := uiPause(in); err != nil {
 			if errors.Is(err, errUIExitRequested) {
+				clearScreen()
+				return
+			}
+			if errors.Is(err, io.EOF) {
 				clearScreen()
 				return
 			}
@@ -1112,6 +1985,22 @@ func uiRunFlagWizard(c *client, in *bufio.Reader) error {
 		{Value: "users-del", Title: "users del", Hint: "Delete by USER_ID"},
 		{Value: "config-get", Title: "config get", Hint: "Get config by key"},
 		{Value: "config-set", Title: "config set", Hint: "Set config key/value"},
+		{Value: "trust-status", Title: "trust status", Hint: "Supports --json"},
+		{Value: "trust-users-list", Title: "trust users list", Hint: "Supports --json"},
+		{Value: "trust-users-add", Title: "trust users add", Hint: "Supports --name, --password, --show-config, --address, --json"},
+		{Value: "trust-users-edit", Title: "trust users edit", Hint: "Supports --name, --password, --json + USER_ID"},
+		{Value: "trust-users-show", Title: "trust users show", Hint: "Supports --show-config, --address, --json + USER_ID"},
+		{Value: "trust-users-config", Title: "trust users config", Hint: "Supports --address, --out, --json + USER_ID"},
+		{Value: "trust-users-del", Title: "trust users del", Hint: "Delete by USER_ID"},
+		{Value: "trust-service", Title: "trust service", Hint: "Run status/start/stop/restart"},
+		{Value: "socks-status", Title: "socks status", Hint: "Supports --json"},
+		{Value: "socks-users-list", Title: "socks users list", Hint: "Supports --json"},
+		{Value: "socks-users-add", Title: "socks users add", Hint: "Supports --name, --password, --show-config, --server, --port, --json"},
+		{Value: "socks-users-edit", Title: "socks users edit", Hint: "Supports --name, --password, --json + USER_ID"},
+		{Value: "socks-users-show", Title: "socks users show", Hint: "Supports --show-config, --server, --port, --json + USER_ID"},
+		{Value: "socks-users-config", Title: "socks users config", Hint: "Supports --server, --port, --out, --json + USER_ID"},
+		{Value: "socks-users-del", Title: "socks users del", Hint: "Delete by USER_ID"},
+		{Value: "socks-service", Title: "socks service", Hint: "Run status/start/stop/restart"},
 		{Value: "apply", Title: "apply", Hint: "Apply config safely"},
 	}
 
@@ -1200,6 +2089,9 @@ func uiBuildWizardArgs(c *client, choice string, in *bufio.Reader) ([]string, er
 		args = append(args, query)
 		return args, nil
 	case "users-show":
+		if err := ensureHiddifyStateLoaded(c); err != nil {
+			return nil, err
+		}
 		u, err := uiPromptUserSelection(c, in, "Select user for users show", "USER_ID for users show")
 		if err != nil {
 			return nil, err
@@ -1222,6 +2114,9 @@ func uiBuildWizardArgs(c *client, choice string, in *bufio.Reader) ([]string, er
 		args = append(args, u.UUID)
 		return args, nil
 	case "users-links":
+		if err := ensureHiddifyStateLoaded(c); err != nil {
+			return nil, err
+		}
 		u, err := uiPromptUserSelection(c, in, "Select user for users links", "USER_ID for users links")
 		if err != nil {
 			return nil, err
@@ -1334,6 +2229,9 @@ func uiBuildWizardArgs(c *client, choice string, in *bufio.Reader) ([]string, er
 		}
 		return args, nil
 	case "users-del":
+		if err := ensureHiddifyStateLoaded(c); err != nil {
+			return nil, err
+		}
 		u, err := uiPromptUserSelection(c, in, "Select user for users del", "USER_ID for users del")
 		if err != nil {
 			return nil, err
@@ -1355,6 +2253,373 @@ func uiBuildWizardArgs(c *client, choice string, in *bufio.Reader) ([]string, er
 			return nil, err
 		}
 		return []string{"config", "set", key, value}, nil
+	case "trust-status":
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"trust", "status"}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "trust-users-list":
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"trust", "users", "list"}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "trust-users-add":
+		name, err := promptRequiredLine(in, "Username (--name)")
+		if err != nil {
+			return nil, err
+		}
+		password, err := promptLine(in, "Password (--password, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		showConfig, err := promptYesNo(in, "Generate config now? (--show-config)", false)
+		if err != nil {
+			return nil, err
+		}
+		address := ""
+		if showConfig {
+			address, err = promptLine(in, "Address ip[:port] (--address, optional)", "")
+			if err != nil {
+				return nil, err
+			}
+		}
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"trust", "users", "add", "--name", strings.TrimSpace(name)}
+		if strings.TrimSpace(password) != "" {
+			args = append(args, "--password", strings.TrimSpace(password))
+		}
+		if showConfig {
+			args = append(args, "--show-config")
+		}
+		if strings.TrimSpace(address) != "" {
+			args = append(args, "--address", strings.TrimSpace(address))
+		}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "trust-users-edit":
+		tt := newTrustClient()
+		u, err := uiPromptTrustUserSelection(tt, in, "Select trust user for trust users edit", "USER_ID for trust users edit")
+		if err != nil {
+			return nil, err
+		}
+		name, err := promptLine(in, "New username (--name, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		password, err := promptLine(in, "New password (--password, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(name) == "" && strings.TrimSpace(password) == "" {
+			return nil, errors.New("no changes requested: set --name and/or --password")
+		}
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"trust", "users", "edit"}
+		if strings.TrimSpace(name) != "" {
+			args = append(args, "--name", strings.TrimSpace(name))
+		}
+		if strings.TrimSpace(password) != "" {
+			args = append(args, "--password", strings.TrimSpace(password))
+		}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		args = append(args, strings.TrimSpace(u.Username))
+		return args, nil
+	case "trust-users-show":
+		tt := newTrustClient()
+		u, err := uiPromptTrustUserSelection(tt, in, "Select trust user for trust users show", "USER_ID for trust users show")
+		if err != nil {
+			return nil, err
+		}
+		showConfig, err := promptYesNo(in, "Generate config now? (--show-config)", false)
+		if err != nil {
+			return nil, err
+		}
+		address := ""
+		if showConfig {
+			address, err = promptLine(in, "Address ip[:port] (--address, optional)", "")
+			if err != nil {
+				return nil, err
+			}
+		}
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"trust", "users", "show"}
+		if showConfig {
+			args = append(args, "--show-config")
+		}
+		if strings.TrimSpace(address) != "" {
+			args = append(args, "--address", strings.TrimSpace(address))
+		}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		args = append(args, strings.TrimSpace(u.Username))
+		return args, nil
+	case "trust-users-config":
+		tt := newTrustClient()
+		u, err := uiPromptTrustUserSelection(tt, in, "Select trust user for trust users config", "USER_ID for trust users config")
+		if err != nil {
+			return nil, err
+		}
+		address, err := promptLine(in, "Address ip[:port] (--address, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		outPath, err := promptLine(in, "Output file (--out, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"trust", "users", "config"}
+		if strings.TrimSpace(address) != "" {
+			args = append(args, "--address", strings.TrimSpace(address))
+		}
+		if strings.TrimSpace(outPath) != "" {
+			args = append(args, "--out", strings.TrimSpace(outPath))
+		}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		args = append(args, strings.TrimSpace(u.Username))
+		return args, nil
+	case "trust-users-del":
+		tt := newTrustClient()
+		u, err := uiPromptTrustUserSelection(tt, in, "Select trust user for trust users del", "USER_ID for trust users del")
+		if err != nil {
+			return nil, err
+		}
+		return []string{"trust", "users", "del", strings.TrimSpace(u.Username)}, nil
+	case "trust-service":
+		action, err := uiSelectOptionValue("TrustTunnel service action", []uiOption{
+			{Value: "status", Title: "status", Hint: "Show systemctl status trusttunnel"},
+			{Value: "start", Title: "start", Hint: "Start trusttunnel service"},
+			{Value: "stop", Title: "stop", Hint: "Stop trusttunnel service"},
+			{Value: "restart", Title: "restart", Hint: "Restart trusttunnel service"},
+		}, 0, in)
+		if err != nil {
+			return nil, err
+		}
+		return []string{"trust", "service", action}, nil
+	case "socks-status":
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"socks", "status"}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "socks-users-list":
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"socks", "users", "list"}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "socks-users-add":
+		name, err := promptRequiredLine(in, "Login (--name)")
+		if err != nil {
+			return nil, err
+		}
+		password, err := promptLine(in, "Password (--password, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		showConfig, err := promptYesNo(in, "Print config now? (--show-config)", false)
+		if err != nil {
+			return nil, err
+		}
+		server := ""
+		port := ""
+		if showConfig {
+			server, err = promptLine(in, "Server (--server, optional)", "")
+			if err != nil {
+				return nil, err
+			}
+			port, err = promptLine(in, "Port (--port, optional)", "")
+			if err != nil {
+				return nil, err
+			}
+		}
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"socks", "users", "add", "--name", strings.TrimSpace(name)}
+		if strings.TrimSpace(password) != "" {
+			args = append(args, "--password", strings.TrimSpace(password))
+		}
+		if showConfig {
+			args = append(args, "--show-config")
+		}
+		if strings.TrimSpace(server) != "" {
+			args = append(args, "--server", strings.TrimSpace(server))
+		}
+		if p := strings.TrimSpace(port); p != "" {
+			args = append(args, "--port", p)
+		}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "socks-users-edit":
+		sc := newSocksClient()
+		u, err := uiPromptSocksUserSelection(sc, in, "Select socks user for socks users edit", "USER_ID for socks users edit")
+		if err != nil {
+			return nil, err
+		}
+		name, err := promptLine(in, "New login (--name, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		password, err := promptLine(in, "New password (--password, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(name) == "" && strings.TrimSpace(password) == "" {
+			return nil, errors.New("no changes requested: set --name and/or --password")
+		}
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"socks", "users", "edit"}
+		if strings.TrimSpace(name) != "" {
+			args = append(args, "--name", strings.TrimSpace(name))
+		}
+		if strings.TrimSpace(password) != "" {
+			args = append(args, "--password", strings.TrimSpace(password))
+		}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		args = append(args, strings.TrimSpace(u.Name))
+		return args, nil
+	case "socks-users-show":
+		sc := newSocksClient()
+		u, err := uiPromptSocksUserSelection(sc, in, "Select socks user for socks users show", "USER_ID for socks users show")
+		if err != nil {
+			return nil, err
+		}
+		showConfig, err := promptYesNo(in, "Print config now? (--show-config)", false)
+		if err != nil {
+			return nil, err
+		}
+		server := ""
+		port := ""
+		if showConfig {
+			server, err = promptLine(in, "Server (--server, optional)", "")
+			if err != nil {
+				return nil, err
+			}
+			port, err = promptLine(in, "Port (--port, optional)", "")
+			if err != nil {
+				return nil, err
+			}
+		}
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"socks", "users", "show"}
+		if showConfig {
+			args = append(args, "--show-config")
+		}
+		if strings.TrimSpace(server) != "" {
+			args = append(args, "--server", strings.TrimSpace(server))
+		}
+		if p := strings.TrimSpace(port); p != "" {
+			args = append(args, "--port", p)
+		}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		args = append(args, strings.TrimSpace(u.Name))
+		return args, nil
+	case "socks-users-config":
+		sc := newSocksClient()
+		u, err := uiPromptSocksUserSelection(sc, in, "Select socks user for socks users config", "USER_ID for socks users config")
+		if err != nil {
+			return nil, err
+		}
+		server, err := promptLine(in, "Server (--server, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		port, err := promptLine(in, "Port (--port, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		outPath, err := promptLine(in, "Output file (--out, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"socks", "users", "config"}
+		if strings.TrimSpace(server) != "" {
+			args = append(args, "--server", strings.TrimSpace(server))
+		}
+		if p := strings.TrimSpace(port); p != "" {
+			args = append(args, "--port", p)
+		}
+		if strings.TrimSpace(outPath) != "" {
+			args = append(args, "--out", strings.TrimSpace(outPath))
+		}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		args = append(args, strings.TrimSpace(u.Name))
+		return args, nil
+	case "socks-users-del":
+		sc := newSocksClient()
+		u, err := uiPromptSocksUserSelection(sc, in, "Select socks user for socks users del", "USER_ID for socks users del")
+		if err != nil {
+			return nil, err
+		}
+		return []string{"socks", "users", "del", strings.TrimSpace(u.Name)}, nil
+	case "socks-service":
+		action, err := uiSelectOptionValue("SOCKS service action", []uiOption{
+			{Value: "status", Title: "status", Hint: "Show systemctl status danted"},
+			{Value: "start", Title: "start", Hint: "Start danted service"},
+			{Value: "stop", Title: "stop", Hint: "Stop danted service"},
+			{Value: "restart", Title: "restart", Hint: "Restart danted service"},
+		}, 0, in)
+		if err != nil {
+			return nil, err
+		}
+		return []string{"socks", "service", action}, nil
 	case "apply":
 		return []string{"apply"}, nil
 	default:
@@ -1826,6 +3091,267 @@ func trimLastRune(s string) string {
 	return string(r[:len(r)-1])
 }
 
+func uiPromptTrustUserSelection(tt *trustClient, in *bufio.Reader, title, manualLabel string) (trustUser, error) {
+	users, err := tt.usersList()
+	if err != nil {
+		return trustUser{}, err
+	}
+	if len(users) == 0 {
+		return trustUser{}, errors.New("no TrustTunnel users")
+	}
+
+	u, err := uiSelectTrustUser(users, title, in)
+	if err == nil {
+		return u, nil
+	}
+	if errors.Is(err, errUIManualEntry) {
+		id, perr := promptRequiredLine(in, manualLabel)
+		if perr != nil {
+			return trustUser{}, perr
+		}
+		u, _, rerr := resolveTrustUser(users, id)
+		return u, rerr
+	}
+	return trustUser{}, err
+}
+
+func uiPromptSocksUserSelection(sc *socksClient, in *bufio.Reader, title, manualLabel string) (socksUser, error) {
+	users, err := sc.usersList()
+	if err != nil {
+		return socksUser{}, err
+	}
+	if len(users) == 0 {
+		return socksUser{}, errors.New("no SOCKS users")
+	}
+
+	shadow := make([]trustUser, 0, len(users))
+	index := map[string]socksUser{}
+	for _, u := range users {
+		shadow = append(shadow, trustUser{Username: u.Name, Password: u.Password})
+		index[strings.ToLower(strings.TrimSpace(u.Name))] = u
+	}
+
+	picked, err := uiSelectTrustUser(shadow, title, in)
+	if err == nil {
+		if u, ok := index[strings.ToLower(strings.TrimSpace(picked.Username))]; ok {
+			return u, nil
+		}
+	}
+	if errors.Is(err, errUIManualEntry) {
+		id, perr := promptRequiredLine(in, manualLabel)
+		if perr != nil {
+			return socksUser{}, perr
+		}
+		u, _, rerr := resolveSocksUser(users, id)
+		return u, rerr
+	}
+	if err == nil {
+		return socksUser{}, errors.New("selected SOCKS user not found")
+	}
+	return socksUser{}, err
+}
+
+func uiSelectTrustUser(users []trustUser, title string, in *bufio.Reader) (trustUser, error) {
+	if len(users) == 0 {
+		return trustUser{}, errors.New("no TrustTunnel users")
+	}
+
+	state, err := enterRawMode()
+	if err != nil {
+		return uiSelectTrustUserFallback(users, title, in)
+	}
+	defer state.restore()
+
+	query := ""
+	selected := 0
+	rawIn := bufio.NewReader(os.Stdin)
+	for {
+		filtered := filterTrustUsersForPicker(users, query)
+		if len(filtered) == 0 {
+			selected = 0
+		} else if selected >= len(filtered) {
+			selected = len(filtered) - 1
+		}
+
+		drawUITrustUserPicker(title, users, filtered, selected, query)
+
+		input, err := readUIMenuKey(rawIn)
+		if err != nil {
+			return trustUser{}, err
+		}
+		switch input.Key {
+		case uiMenuKeyUp:
+			if len(filtered) == 0 {
+				continue
+			}
+			selected--
+			if selected < 0 {
+				selected = len(filtered) - 1
+			}
+		case uiMenuKeyDown:
+			if len(filtered) == 0 {
+				continue
+			}
+			selected++
+			if selected >= len(filtered) {
+				selected = 0
+			}
+		case uiMenuKeyHome:
+			selected = 0
+		case uiMenuKeyEnd:
+			if len(filtered) > 0 {
+				selected = len(filtered) - 1
+			}
+		case uiMenuKeyBackspace:
+			query = trimLastRune(query)
+		case uiMenuKeyEnter:
+			if len(filtered) == 0 {
+				continue
+			}
+			return filtered[selected], nil
+		case uiMenuKeyQuit:
+			return trustUser{}, errUISelectionCanceled
+		case uiMenuKeyChar:
+			ch := unicode.ToLower(input.Ch)
+			switch ch {
+			case 'k':
+				if len(filtered) == 0 {
+					continue
+				}
+				selected--
+				if selected < 0 {
+					selected = len(filtered) - 1
+				}
+			case 'j':
+				if len(filtered) == 0 {
+					continue
+				}
+				selected++
+				if selected >= len(filtered) {
+					selected = 0
+				}
+			case 'q':
+				return trustUser{}, errUISelectionCanceled
+			case 'i':
+				return trustUser{}, errUIManualEntry
+			default:
+				query += string(input.Ch)
+			}
+		}
+	}
+}
+
+func uiSelectTrustUserFallback(users []trustUser, title string, in *bufio.Reader) (trustUser, error) {
+	clearScreen()
+
+	fmt.Println()
+	fmt.Println(title)
+	fmt.Println(strings.Repeat("=", len(title)))
+	fmt.Println()
+
+	for i, u := range users {
+		fmt.Printf("  %d. %-24s %s\n", i+1, u.Username, maskSecret(u.Password))
+	}
+	fmt.Println("  0. Manual USER_ID input")
+	fmt.Println("  q. Cancel")
+
+	for {
+		raw, err := promptRequiredLine(in, "\nEnter user number")
+		if err != nil {
+			return trustUser{}, err
+		}
+		raw = strings.TrimSpace(raw)
+		if strings.EqualFold(raw, "q") {
+			return trustUser{}, errUISelectionCanceled
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 || n > len(users) {
+			printError(fmt.Sprintf("Invalid. Enter 0-%d or q", len(users)))
+			continue
+		}
+		if n == 0 {
+			return trustUser{}, errUIManualEntry
+		}
+		return users[n-1], nil
+	}
+}
+
+func drawUITrustUserPicker(title string, users, filtered []trustUser, selected int, query string) {
+	clearScreen()
+
+	fmt.Println()
+	fmt.Println(title)
+	fmt.Println(strings.Repeat("=", len(title)))
+	fmt.Println()
+	fmt.Println("Controls: Up/Down to navigate, Enter to select, Type to filter")
+	fmt.Println("          Backspace to erase, i for manual input, q to cancel")
+	fmt.Println()
+	fmt.Printf("Filter: %s\n", query)
+	fmt.Printf("Showing: %d / %d users\n", len(filtered), len(users))
+	fmt.Println(strings.Repeat("-", 60))
+
+	if len(filtered) == 0 {
+		fmt.Println("  No users match current filter")
+		return
+	}
+
+	const pageSize = 12
+	start := 0
+	if selected >= pageSize {
+		start = selected - pageSize + 1
+	}
+	if start+pageSize > len(filtered) {
+		start = len(filtered) - pageSize
+		if start < 0 {
+			start = 0
+		}
+	}
+	end := min(len(filtered), start+pageSize)
+
+	fmt.Println()
+	for i := start; i < end; i++ {
+		u := filtered[i]
+		prefix := "   "
+		if i == selected {
+			prefix = ">> "
+		}
+		name := u.Username
+		if len(name) > 24 {
+			name = name[:21] + "..."
+		}
+		fmt.Printf("%s%-24s  %s\n", prefix, name, maskSecret(u.Password))
+	}
+
+	if end < len(filtered) {
+		fmt.Printf("\n  (Showing %d-%d of %d)\n", start+1, end, len(filtered))
+	}
+	fmt.Println()
+}
+
+func filterTrustUsersForPicker(users []trustUser, query string) []trustUser {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return users
+	}
+	out := make([]trustUser, 0, len(users))
+	for _, u := range users {
+		name := strings.ToLower(strings.TrimSpace(u.Username))
+		if strings.Contains(name, q) {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+func findTrustUserIndex(users []trustUser, username string) int {
+	for i, u := range users {
+		if strings.EqualFold(strings.TrimSpace(u.Username), strings.TrimSpace(username)) {
+			return i
+		}
+	}
+	return -1
+}
+
 func uiStatus(c *client) error {
 	if err := c.loadState(); err != nil {
 		return err
@@ -1844,6 +3370,14 @@ func uiStatus(c *client) error {
 	fmt.Printf("Hysteria base port  : %v\n", cfg["hysteria_port"])
 	fmt.Printf("Reality SNI         : %v\n", cfg["reality_server_names"])
 	fmt.Printf("Users               : %d\n", len(c.state.Users))
+	if tt, err := newTrustClient().status(); err == nil {
+		fmt.Printf("TrustTunnel installed: %t\n", tt.Installed)
+		if tt.Installed {
+			fmt.Printf("TrustTunnel active   : %t\n", tt.ServiceActive)
+			fmt.Printf("TrustTunnel listen   : %s\n", tt.ListenAddress)
+			fmt.Printf("TrustTunnel users    : %d\n", tt.Users)
+		}
+	}
 	return nil
 }
 
@@ -2341,6 +3875,620 @@ func uiDeleteUser(c *client, in *bufio.Reader) error {
 	return nil
 }
 
+func uiSocksProxy(in *bufio.Reader) error {
+	sc := newSocksClient()
+	for {
+		action, err := uiSelectOptionValue("SOCKS5 (Dante)", []uiOption{
+			{Value: "status", Title: "Status", Hint: "Show SOCKS service/config summary"},
+			{Value: "list", Title: "List users", Hint: "Show SOCKS logins and masked passwords"},
+			{Value: "add", Title: "Add user", Hint: "Create SOCKS login and set Linux password"},
+			{Value: "edit", Title: "Edit user", Hint: "Rename login and/or change password"},
+			{Value: "show", Title: "Show user", Hint: "Show login/password and optional connect params"},
+			{Value: "delete", Title: "Delete user", Hint: "Remove SOCKS login and Linux user"},
+			{Value: "service", Title: "Service control", Hint: "status/start/stop/restart danted"},
+			{Value: "back", Title: "Back", Hint: "Return to main menu"},
+		}, 0, in)
+		if err != nil {
+			if errors.Is(err, errUISelectionCanceled) || errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+
+		var actionErr error
+		switch action {
+		case "back":
+			return nil
+		case "status":
+			actionErr = uiSocksStatus(sc)
+		case "list":
+			actionErr = uiSocksListUsers(sc)
+		case "add":
+			actionErr = uiSocksAddUser(sc, in)
+		case "edit":
+			actionErr = uiSocksEditUser(sc, in)
+		case "show":
+			actionErr = uiSocksShowUser(sc, in)
+		case "delete":
+			actionErr = uiSocksDeleteUser(sc, in)
+		case "service":
+			actionErr = uiSocksService(sc, in)
+		default:
+			actionErr = fmt.Errorf("unknown socks action: %s", action)
+		}
+
+		if actionErr != nil {
+			if errors.Is(actionErr, errUISelectionCanceled) {
+				fmt.Println("\nCanceled.")
+			} else if errors.Is(actionErr, errUIExitRequested) || errors.Is(actionErr, io.EOF) {
+				return nil
+			} else {
+				fmt.Printf("\nERROR: %v\n", actionErr)
+			}
+		}
+
+		if err := uiPause(in); err != nil {
+			if errors.Is(err, errUIExitRequested) || errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func uiSocksStatus(sc *socksClient) error {
+	st, err := sc.status()
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println("SOCKS5 status")
+	fmt.Println("=============")
+	printSocksStatus(st)
+	return nil
+}
+
+func uiSocksListUsers(sc *socksClient) error {
+	users, err := sc.usersList()
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println("SOCKS users")
+	fmt.Println("===========")
+	printSocksUsers(users)
+	return nil
+}
+
+func uiSocksAddUser(sc *socksClient, in *bufio.Reader) error {
+	if err := requireRoot("socks users add"); err != nil {
+		return err
+	}
+	login, err := promptRequiredLine(in, "SOCKS login")
+	if err != nil {
+		return err
+	}
+	login = normalizeSocksLogin(login)
+	if err := validateSocksLogin(login); err != nil {
+		return err
+	}
+
+	users, err := sc.usersList()
+	if err != nil {
+		return err
+	}
+	if hasSocksUserExact(users, login) {
+		return fmt.Errorf("socks user already exists: %s", login)
+	}
+	if osSocksUserExists(login) {
+		return fmt.Errorf("linux user already exists: %s", login)
+	}
+
+	password, err := promptLine(in, "Password (empty = auto-generate)", "")
+	if err != nil {
+		return err
+	}
+	password = strings.TrimSpace(password)
+	if password == "" {
+		password = newSecureToken(24)
+	}
+
+	if err := sc.ensureLinuxUser(login, password); err != nil {
+		return err
+	}
+	u := socksUser{Name: login, Password: password, SystemUser: login}
+	users = append(users, u)
+	if err := sc.writeUsers(users); err != nil {
+		return err
+	}
+
+	fmt.Printf("\nSOCKS user added: %s\n", login)
+	fmt.Printf("Password: %s\n", password)
+
+	showConfig, err := promptYesNo(in, "Print connection config now?", true)
+	if err != nil {
+		return err
+	}
+	if !showConfig {
+		return nil
+	}
+	return uiSocksPrintConn(sc, in, u)
+}
+
+func uiSocksPrintConn(sc *socksClient, in *bufio.Reader, u socksUser) error {
+	server, err := promptLine(in, "Server host/ip (empty = auto detect)", "")
+	if err != nil {
+		return err
+	}
+	portRaw, err := promptLine(in, "Port (empty = from danted config)", "")
+	if err != nil {
+		return err
+	}
+	port := 0
+	if strings.TrimSpace(portRaw) != "" {
+		p, err := strconv.Atoi(strings.TrimSpace(portRaw))
+		if err != nil {
+			return fmt.Errorf("invalid port: %s", strings.TrimSpace(portRaw))
+		}
+		port = p
+	}
+	cfg, err := sc.connectionConfig(u, strings.TrimSpace(server), port)
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	printSocksConnInfo(cfg)
+	return nil
+}
+
+func uiSocksEditUser(sc *socksClient, in *bufio.Reader) error {
+	if err := requireRoot("socks users edit"); err != nil {
+		return err
+	}
+	users, err := sc.usersList()
+	if err != nil {
+		return err
+	}
+	current, err := uiPromptSocksUserSelection(sc, in, "Select SOCKS user to edit", "USER_ID to edit")
+	if err != nil {
+		return err
+	}
+	idx := findSocksUserIndex(users, current.Name)
+	if idx < 0 {
+		return fmt.Errorf("selected user not found: %s", current.Name)
+	}
+
+	newName, err := promptLine(in, fmt.Sprintf("New login (empty = keep: %s)", current.Name), "")
+	if err != nil {
+		return err
+	}
+	newName = normalizeSocksLogin(newName)
+	if newName != "" && newName != current.Name {
+		if err := validateSocksLogin(newName); err != nil {
+			return err
+		}
+		for i, u := range users {
+			if i == idx {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(u.Name), newName) {
+				return fmt.Errorf("socks user already exists: %s", newName)
+			}
+		}
+		if osSocksUserExists(newName) {
+			return fmt.Errorf("linux user already exists: %s", newName)
+		}
+		if err := runCommand("usermod", "-l", newName, socksSystemUser(current)); err != nil {
+			return err
+		}
+		users[idx].Name = newName
+		users[idx].SystemUser = newName
+	}
+
+	newPassword, err := promptLine(in, "New password (empty = keep current)", "")
+	if err != nil {
+		return err
+	}
+	newPassword = strings.TrimSpace(newPassword)
+	if newPassword != "" {
+		if err := sc.setLinuxUserPassword(socksSystemUser(users[idx]), newPassword); err != nil {
+			return err
+		}
+		users[idx].Password = newPassword
+	}
+
+	if users[idx] == current {
+		fmt.Println("\nNo changes requested.")
+		return nil
+	}
+	if err := sc.writeUsers(users); err != nil {
+		return err
+	}
+	fmt.Printf("\nSOCKS user updated: %s -> %s\n", current.Name, users[idx].Name)
+	if newPassword != "" {
+		fmt.Printf("New password: %s\n", newPassword)
+	}
+	return nil
+}
+
+func uiSocksShowUser(sc *socksClient, in *bufio.Reader) error {
+	u, err := uiPromptSocksUserSelection(sc, in, "Select SOCKS user", "USER_ID to show")
+	if err != nil {
+		return err
+	}
+	printSocksUser(u)
+	showConfig, err := promptYesNo(in, "Print connection config?", true)
+	if err != nil {
+		return err
+	}
+	if !showConfig {
+		return nil
+	}
+	return uiSocksPrintConn(sc, in, u)
+}
+
+func uiSocksDeleteUser(sc *socksClient, in *bufio.Reader) error {
+	if err := requireRoot("socks users del"); err != nil {
+		return err
+	}
+	users, err := sc.usersList()
+	if err != nil {
+		return err
+	}
+	u, err := uiPromptSocksUserSelection(sc, in, "Select SOCKS user to delete", "USER_ID to delete")
+	if err != nil {
+		return err
+	}
+	idx := findSocksUserIndex(users, u.Name)
+	if idx < 0 {
+		return fmt.Errorf("selected user not found: %s", u.Name)
+	}
+	confirm, err := promptLine(in, fmt.Sprintf("Delete SOCKS user %s? (yes/no)", u.Name), "no")
+	if err != nil {
+		return err
+	}
+	if !isYes(confirm) {
+		fmt.Println("Canceled.")
+		return nil
+	}
+	next := make([]socksUser, 0, len(users)-1)
+	next = append(next, users[:idx]...)
+	next = append(next, users[idx+1:]...)
+	if err := sc.writeUsers(next); err != nil {
+		return err
+	}
+	fmt.Printf("Deleted SOCKS user: %s\n", u.Name)
+	if err := sc.deleteLinuxUser(socksSystemUser(u)); err != nil {
+		fmt.Printf("Warning: %v\n", err)
+	}
+	return nil
+}
+
+func uiSocksService(sc *socksClient, in *bufio.Reader) error {
+	action, err := uiSelectOptionValue("SOCKS service", []uiOption{
+		{Value: "status", Title: "status", Hint: "Show systemctl status"},
+		{Value: "start", Title: "start", Hint: "Start service"},
+		{Value: "stop", Title: "stop", Hint: "Stop service"},
+		{Value: "restart", Title: "restart", Hint: "Restart service"},
+		{Value: "back", Title: "back", Hint: "Return to SOCKS menu"},
+	}, 0, in)
+	if err != nil {
+		return err
+	}
+	if action == "back" {
+		return nil
+	}
+	switch action {
+	case "status":
+		return runCommand("systemctl", "--no-pager", "--full", "status", sc.service)
+	case "start", "stop", "restart":
+		if err := runCommand("systemctl", action, sc.service); err != nil {
+			return err
+		}
+		fmt.Printf("SOCKS service %s: %s\n", action, sc.service)
+		return nil
+	default:
+		return fmt.Errorf("unknown action: %s", action)
+	}
+}
+
+func uiTrustTunnel(in *bufio.Reader) error {
+	tt := newTrustClient()
+	for {
+		action, err := uiSelectOptionValue("TrustTunnel", []uiOption{
+			{Value: "status", Title: "Status", Hint: "Show TrustTunnel service/config summary"},
+			{Value: "list", Title: "List users", Hint: "Show users from credentials.toml"},
+			{Value: "add", Title: "Add user", Hint: "Create TrustTunnel user and restart service"},
+			{Value: "edit", Title: "Edit user", Hint: "Rename user and/or change password"},
+			{Value: "show", Title: "Show user", Hint: "Show username/password and optional client config"},
+			{Value: "delete", Title: "Delete user", Hint: "Remove user and restart service"},
+			{Value: "service", Title: "Service control", Hint: "status/start/stop/restart trusttunnel"},
+			{Value: "back", Title: "Back", Hint: "Return to main menu"},
+		}, 0, in)
+		if err != nil {
+			if errors.Is(err, errUISelectionCanceled) {
+				return nil
+			}
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+
+		var actionErr error
+		switch action {
+		case "back":
+			return nil
+		case "status":
+			actionErr = uiTrustStatus(tt)
+		case "list":
+			actionErr = uiTrustListUsers(tt)
+		case "add":
+			actionErr = uiTrustAddUser(tt, in)
+		case "edit":
+			actionErr = uiTrustEditUser(tt, in)
+		case "show":
+			actionErr = uiTrustShowUser(tt, in)
+		case "delete":
+			actionErr = uiTrustDeleteUser(tt, in)
+		case "service":
+			actionErr = uiTrustService(tt, in)
+		default:
+			actionErr = fmt.Errorf("unknown trust action: %s", action)
+		}
+
+		if actionErr != nil {
+			if errors.Is(actionErr, errUISelectionCanceled) {
+				fmt.Println("\nCanceled.")
+			} else if errors.Is(actionErr, errUIExitRequested) || errors.Is(actionErr, io.EOF) {
+				return nil
+			} else {
+				fmt.Printf("\nERROR: %v\n", actionErr)
+			}
+		}
+
+		if err := uiPause(in); err != nil {
+			if errors.Is(err, errUIExitRequested) || errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func uiTrustStatus(tt *trustClient) error {
+	st, err := tt.status()
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println("TrustTunnel status")
+	fmt.Println("==================")
+	printTrustStatus(st)
+	return nil
+}
+
+func uiTrustListUsers(tt *trustClient) error {
+	users, err := tt.usersList()
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println("TrustTunnel users")
+	fmt.Println("=================")
+	printTrustUsers(users)
+	return nil
+}
+
+func uiTrustAddUser(tt *trustClient, in *bufio.Reader) error {
+	username, err := promptRequiredLine(in, "Trust username")
+	if err != nil {
+		return err
+	}
+	username = strings.TrimSpace(username)
+	if err := validateTrustUsername(username); err != nil {
+		return err
+	}
+
+	users, err := tt.usersList()
+	if err != nil {
+		return err
+	}
+	if hasTrustUserExact(users, username) {
+		return fmt.Errorf("trust user already exists: %s", username)
+	}
+
+	password, err := promptLine(in, "Password (empty = auto-generate)", "")
+	if err != nil {
+		return err
+	}
+	password = strings.TrimSpace(password)
+	if password == "" {
+		password = newSecureToken(24)
+	}
+
+	users = append(users, trustUser{Username: username, Password: password})
+	if err := tt.writeUsers(users); err != nil {
+		return err
+	}
+
+	fmt.Printf("\nTrustTunnel user added: %s\n", username)
+	fmt.Printf("Password: %s\n", password)
+	if warn := trustRestartWarning(tt.service, tt.restartService()); warn != "" {
+		fmt.Printf("Warning: %s\n", warn)
+	}
+
+	showConfig, err := promptYesNo(in, "Generate client config now?", false)
+	if err != nil {
+		return err
+	}
+	if !showConfig {
+		return nil
+	}
+	return uiTrustPrintClientConfig(tt, in, username)
+}
+
+func uiTrustPrintClientConfig(tt *trustClient, in *bufio.Reader, username string) error {
+	address, err := promptLine(in, "Address ip[:port] (empty = auto detect)", "")
+	if err != nil {
+		return err
+	}
+	configText, err := tt.exportClientConfig(username, strings.TrimSpace(address))
+	if err != nil && strings.TrimSpace(address) == "" {
+		fmt.Printf("Auto address detection failed: %v\n", err)
+		manualAddress, perr := promptRequiredLine(in, "Address ip[:port] (manual)")
+		if perr != nil {
+			return perr
+		}
+		configText, err = tt.exportClientConfig(username, strings.TrimSpace(manualAddress))
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Printf("Address: %s\n", tt.lastExportAddress)
+	fmt.Println(configText)
+	return nil
+}
+
+func uiTrustEditUser(tt *trustClient, in *bufio.Reader) error {
+	users, err := tt.usersList()
+	if err != nil {
+		return err
+	}
+	current, err := uiPromptTrustUserSelection(tt, in, "Select TrustTunnel user to edit", "USER_ID to edit")
+	if err != nil {
+		return err
+	}
+	idx := findTrustUserIndex(users, current.Username)
+	if idx < 0 {
+		return fmt.Errorf("selected user not found: %s", current.Username)
+	}
+
+	newName, err := promptLine(in, fmt.Sprintf("New username (empty = keep: %s)", current.Username), "")
+	if err != nil {
+		return err
+	}
+	newName = strings.TrimSpace(newName)
+	if newName != "" {
+		if err := validateTrustUsername(newName); err != nil {
+			return err
+		}
+		for i, u := range users {
+			if i == idx {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(u.Username), newName) {
+				return fmt.Errorf("trust user already exists: %s", newName)
+			}
+		}
+		users[idx].Username = newName
+	}
+
+	newPassword, err := promptLine(in, "New password (empty = keep current)", "")
+	if err != nil {
+		return err
+	}
+	newPassword = strings.TrimSpace(newPassword)
+	if newPassword != "" {
+		users[idx].Password = newPassword
+	}
+
+	if users[idx] == current {
+		fmt.Println("\nNo changes requested.")
+		return nil
+	}
+
+	if err := tt.writeUsers(users); err != nil {
+		return err
+	}
+	fmt.Printf("\nTrustTunnel user updated: %s\n", current.Username)
+	if warn := trustRestartWarning(tt.service, tt.restartService()); warn != "" {
+		fmt.Printf("Warning: %s\n", warn)
+	}
+	printTrustUser(users[idx])
+	return nil
+}
+
+func uiTrustShowUser(tt *trustClient, in *bufio.Reader) error {
+	u, err := uiPromptTrustUserSelection(tt, in, "Select TrustTunnel user", "USER_ID to show")
+	if err != nil {
+		return err
+	}
+	printTrustUser(u)
+
+	showConfig, err := promptYesNo(in, "Generate client config?", false)
+	if err != nil {
+		return err
+	}
+	if !showConfig {
+		return nil
+	}
+	return uiTrustPrintClientConfig(tt, in, u.Username)
+}
+
+func uiTrustDeleteUser(tt *trustClient, in *bufio.Reader) error {
+	users, err := tt.usersList()
+	if err != nil {
+		return err
+	}
+	u, err := uiPromptTrustUserSelection(tt, in, "Select TrustTunnel user to delete", "USER_ID to delete")
+	if err != nil {
+		return err
+	}
+	idx := findTrustUserIndex(users, u.Username)
+	if idx < 0 {
+		return fmt.Errorf("selected user not found: %s", u.Username)
+	}
+	confirm, err := promptLine(in, fmt.Sprintf("Delete trust user %s? (yes/no)", u.Username), "no")
+	if err != nil {
+		return err
+	}
+	if !isYes(confirm) {
+		fmt.Println("Canceled.")
+		return nil
+	}
+	next := make([]trustUser, 0, len(users)-1)
+	next = append(next, users[:idx]...)
+	next = append(next, users[idx+1:]...)
+	if err := tt.writeUsers(next); err != nil {
+		return err
+	}
+	fmt.Printf("Deleted trust user: %s\n", u.Username)
+	if warn := trustRestartWarning(tt.service, tt.restartService()); warn != "" {
+		fmt.Printf("Warning: %s\n", warn)
+	}
+	return nil
+}
+
+func uiTrustService(tt *trustClient, in *bufio.Reader) error {
+	action, err := uiSelectOptionValue("TrustTunnel service", []uiOption{
+		{Value: "status", Title: "status", Hint: "Show systemctl status"},
+		{Value: "start", Title: "start", Hint: "Start service"},
+		{Value: "stop", Title: "stop", Hint: "Stop service"},
+		{Value: "restart", Title: "restart", Hint: "Restart service"},
+		{Value: "back", Title: "back", Hint: "Return to TrustTunnel menu"},
+	}, 0, in)
+	if err != nil {
+		return err
+	}
+	if action == "back" {
+		return nil
+	}
+	switch action {
+	case "status":
+		return runCommand("systemctl", "--no-pager", "--full", "status", tt.service)
+	case "start", "stop", "restart":
+		if err := runCommand("systemctl", action, tt.service); err != nil {
+			return err
+		}
+		fmt.Printf("TrustTunnel service %s: %s\n", action, tt.service)
+		return nil
+	default:
+		return fmt.Errorf("unknown action: %s", action)
+	}
+}
+
 func uiAdminURL(c *client) error {
 	if err := c.loadState(); err != nil {
 		return err
@@ -2365,6 +4513,16 @@ func mustClient(loadState bool) *client {
 	return c
 }
 
+func ensureHiddifyStateLoaded(c *client) error {
+	if c == nil {
+		return errors.New("nil client")
+	}
+	if strings.TrimSpace(c.state.APIPath) != "" && strings.TrimSpace(c.state.APIKey) != "" {
+		return nil
+	}
+	return c.loadState()
+}
+
 func detectPanelPython() string {
 	candidates := []string{
 		"/opt/hiddify-manager/.venv313/bin/python3",
@@ -2376,6 +4534,849 @@ func detectPanelPython() string {
 		}
 	}
 	return "python3"
+}
+
+func newTrustClient() *trustClient {
+	return &trustClient{
+		dir:     envOr("PSAS_TT_DIR", defaultTrustDir),
+		service: envOr("PSAS_TT_SERVICE", defaultTrustService),
+	}
+}
+
+func (t *trustClient) status() (trustStatus, error) {
+	st := trustStatus{
+		Installed: t.installed(),
+		Service:   t.service,
+		Directory: t.dir,
+	}
+
+	active, err := t.serviceIsActive()
+	if err == nil {
+		st.ServiceActive = active
+	}
+
+	if !st.Installed {
+		return st, nil
+	}
+
+	if listen, lerr := t.listenAddress(); lerr == nil {
+		st.ListenAddress = listen
+	}
+	if host, herr := t.hostname(); herr == nil {
+		st.Hostname = host
+	}
+	users, uerr := t.usersList()
+	if uerr == nil {
+		st.Users = len(users)
+	}
+	return st, nil
+}
+
+func (t *trustClient) installed() bool {
+	return fileExists(t.endpointPath())
+}
+
+func (t *trustClient) endpointPath() string {
+	return filepath.Join(t.dir, defaultTrustEndpoint)
+}
+
+func (t *trustClient) vpnPath() string {
+	return filepath.Join(t.dir, "vpn.toml")
+}
+
+func (t *trustClient) hostsPath() string {
+	return filepath.Join(t.dir, "hosts.toml")
+}
+
+func (t *trustClient) serviceIsActive() (bool, error) {
+	out, err := runCommandOutput("systemctl", "is-active", t.service)
+	state := strings.ToLower(strings.TrimSpace(out))
+	switch state {
+	case "active":
+		return true, nil
+	case "inactive", "failed", "activating", "deactivating", "not-found", "unknown":
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("systemctl is-active %s: %w (%s)", t.service, err, strings.TrimSpace(out))
+	}
+	return false, nil
+}
+
+func (t *trustClient) restartService() error {
+	return runCommand("systemctl", "restart", t.service)
+}
+
+func (t *trustClient) listenAddress() (string, error) {
+	raw, err := os.ReadFile(t.vpnPath())
+	if err != nil {
+		return "", err
+	}
+	v, ok, err := parseTOMLStringKey(string(raw), "listen_address")
+	if err != nil {
+		return "", err
+	}
+	if !ok || strings.TrimSpace(v) == "" {
+		return "", errors.New("listen_address not found in vpn.toml")
+	}
+	return strings.TrimSpace(v), nil
+}
+
+func (t *trustClient) hostname() (string, error) {
+	raw, err := os.ReadFile(t.hostsPath())
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r", ""), "\n")
+	inMainHosts := false
+	for _, line := range lines {
+		trimmed := stripTOMLComment(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[[") && strings.HasSuffix(trimmed, "]]") {
+			section := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
+			inMainHosts = section == "main_hosts"
+			continue
+		}
+		if !inMainHosts {
+			continue
+		}
+		if v, ok, err := parseTOMLStringAssignment(trimmed, "hostname"); err != nil {
+			return "", err
+		} else if ok {
+			return strings.TrimSpace(v), nil
+		}
+	}
+
+	if v, ok, err := parseTOMLStringKey(string(raw), "hostname"); err != nil {
+		return "", err
+	} else if ok {
+		return strings.TrimSpace(v), nil
+	}
+	return "", errors.New("hostname not found in hosts.toml")
+}
+
+func (t *trustClient) credentialsPath() (string, error) {
+	path := "credentials.toml"
+	if raw, err := os.ReadFile(t.vpnPath()); err == nil {
+		if v, _, perr := parseTOMLStringKey(string(raw), "credentials_file"); perr == nil && strings.TrimSpace(v) != "" {
+			path = strings.TrimSpace(v)
+		}
+	}
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+	return filepath.Join(t.dir, path), nil
+}
+
+func (t *trustClient) usersList() ([]trustUser, error) {
+	if !t.installed() {
+		return nil, fmt.Errorf("TrustTunnel is not installed at %s", t.dir)
+	}
+	credPath, err := t.credentialsPath()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(credPath)
+	if err != nil {
+		return nil, err
+	}
+	users, err := parseTrustCredentials(string(raw))
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", credPath, err)
+	}
+	return users, nil
+}
+
+func (t *trustClient) writeUsers(users []trustUser) error {
+	credPath, err := t.credentialsPath()
+	if err != nil {
+		return err
+	}
+	mode := os.FileMode(0o600)
+	if info, err := os.Stat(credPath); err == nil {
+		mode = info.Mode()
+	}
+
+	payload, err := renderTrustCredentials(users)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(credPath, []byte(payload), mode)
+}
+
+func (t *trustClient) exportClientConfig(username, address string) (string, error) {
+	if !t.installed() {
+		return "", fmt.Errorf("TrustTunnel is not installed at %s", t.dir)
+	}
+	address = strings.TrimSpace(address)
+	var err error
+	if address == "" {
+		address, err = t.defaultExportAddress()
+		if err != nil {
+			return "", err
+		}
+	} else {
+		address, err = t.normalizeExportAddress(address)
+		if err != nil {
+			return "", err
+		}
+	}
+	cmd := exec.Command(t.endpointPath(), "vpn.toml", "hosts.toml", "-c", username, "-a", address)
+	cmd.Dir = t.dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("trusttunnel_endpoint export failed: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	t.lastExportAddress = address
+	return strings.TrimSpace(string(out)), nil
+}
+
+func (t *trustClient) defaultExportAddress() (string, error) {
+	listen, err := t.listenAddress()
+	if err != nil {
+		return "", err
+	}
+	_, port, err := parseListenAddress(listen)
+	if err != nil {
+		return "", err
+	}
+	ip, err := detectPublicIPv4()
+	if err != nil {
+		return "", err
+	}
+	return ip + ":" + port, nil
+}
+
+func (t *trustClient) normalizeExportAddress(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("empty address")
+	}
+	if isIPv4(raw) {
+		listen, err := t.listenAddress()
+		if err != nil {
+			return "", err
+		}
+		_, port, err := parseListenAddress(listen)
+		if err != nil {
+			return "", err
+		}
+		return raw + ":" + port, nil
+	}
+	host, port, err := parseListenAddress(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid --address %q: expected ip or ip:port", raw)
+	}
+	if !isIPv4(host) {
+		return "", fmt.Errorf("invalid --address host %q: TrustTunnel expects ip or ip:port", host)
+	}
+	return host + ":" + port, nil
+}
+
+func newSocksClient() *socksClient {
+	return &socksClient{
+		service: envOr("PSAS_SOCKS_SERVICE", defaultSocksService),
+		config:  envOr("PSAS_SOCKS_CONF", defaultSocksConfig),
+		users:   envOr("PSAS_SOCKS_USERS", defaultSocksUsers),
+	}
+}
+
+func (s *socksClient) status() (socksStatus, error) {
+	st := socksStatus{
+		Installed:  s.installed(),
+		Service:    s.service,
+		ConfigPath: s.config,
+	}
+	active, err := s.serviceIsActive()
+	if err == nil {
+		st.ServiceActive = active
+	}
+	if !st.Installed {
+		return st, nil
+	}
+	if listen, err := s.listenAddress(); err == nil {
+		st.ListenAddress = listen
+	}
+	if users, err := s.usersList(); err == nil {
+		st.Users = len(users)
+	}
+	return st, nil
+}
+
+func (s *socksClient) installed() bool {
+	if _, err := exec.LookPath("danted"); err == nil {
+		return true
+	}
+	return fileExists("/usr/sbin/danted") || fileExists("/usr/bin/danted")
+}
+
+func (s *socksClient) serviceIsActive() (bool, error) {
+	out, err := runCommandOutput("systemctl", "is-active", s.service)
+	state := strings.ToLower(strings.TrimSpace(out))
+	switch state {
+	case "active":
+		return true, nil
+	case "inactive", "failed", "activating", "deactivating", "not-found", "unknown":
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("systemctl is-active %s: %w (%s)", s.service, err, strings.TrimSpace(out))
+	}
+	return false, nil
+}
+
+func (s *socksClient) restartService() error {
+	return runCommand("systemctl", "restart", s.service)
+}
+
+func (s *socksClient) listenAddress() (string, error) {
+	raw, err := os.ReadFile(s.config)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r", ""), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		if line == "" {
+			continue
+		}
+		m := dantedInternalRe.FindStringSubmatch(line)
+		if len(m) == 0 {
+			continue
+		}
+		host := strings.Trim(strings.TrimSpace(m[1]), "[]")
+		if host == "" {
+			host = "0.0.0.0"
+		}
+		port := strings.TrimSpace(m[2])
+		if port == "" {
+			port = strconv.Itoa(defaultSocksPort)
+		}
+		p, err := strconv.Atoi(port)
+		if err != nil || p < 1 || p > 65535 {
+			return "", fmt.Errorf("invalid SOCKS port in %s: %s", s.config, port)
+		}
+		if strings.Contains(host, ":") {
+			return net.JoinHostPort(host, port), nil
+		}
+		return host + ":" + port, nil
+	}
+	return "", fmt.Errorf("internal listen address not found in %s", s.config)
+}
+
+func (s *socksClient) usersList() ([]socksUser, error) {
+	if !fileExists(s.users) {
+		return []socksUser{}, nil
+	}
+	raw, err := os.ReadFile(s.users)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(string(raw)) == "" {
+		return []socksUser{}, nil
+	}
+	var users []socksUser
+	if err := json.Unmarshal(raw, &users); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", s.users, err)
+	}
+	out := make([]socksUser, 0, len(users))
+	for _, u := range users {
+		name := normalizeSocksLogin(u.Name)
+		if name == "" {
+			continue
+		}
+		systemUser := strings.TrimSpace(u.SystemUser)
+		if systemUser == "" {
+			systemUser = name
+		}
+		out = append(out, socksUser{
+			Name:       name,
+			Password:   strings.TrimSpace(u.Password),
+			SystemUser: strings.TrimSpace(systemUser),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+func (s *socksClient) writeUsers(users []socksUser) error {
+	for i := range users {
+		users[i].Name = normalizeSocksLogin(users[i].Name)
+		if users[i].SystemUser == "" {
+			users[i].SystemUser = users[i].Name
+		}
+	}
+	payload, err := json.MarshalIndent(users, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(s.users), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.users, append(payload, '\n'), 0o600)
+}
+
+func (s *socksClient) ensureLinuxUser(login, password string) error {
+	login = normalizeSocksLogin(login)
+	if err := validateSocksLogin(login); err != nil {
+		return err
+	}
+	if !osSocksUserExists(login) {
+		shell := "/usr/sbin/nologin"
+		if !fileExists(shell) {
+			shell = "/sbin/nologin"
+		}
+		if !fileExists(shell) {
+			shell = "/bin/false"
+		}
+		if err := runCommand("useradd", "-M", "-N", "-s", shell, login); err != nil {
+			return fmt.Errorf("useradd %s: %w", login, err)
+		}
+	}
+	if err := s.setLinuxUserPassword(login, password); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *socksClient) setLinuxUserPassword(login, password string) error {
+	login = strings.TrimSpace(login)
+	if login == "" {
+		return errors.New("empty login")
+	}
+	if strings.TrimSpace(password) == "" {
+		return errors.New("empty password")
+	}
+	line := login + ":" + password + "\n"
+	if err := runCommandInput(line, "chpasswd"); err != nil {
+		return fmt.Errorf("chpasswd for %s: %w", login, err)
+	}
+	return nil
+}
+
+func (s *socksClient) deleteLinuxUser(login string) error {
+	login = strings.TrimSpace(login)
+	if login == "" {
+		return nil
+	}
+	if !osSocksUserExists(login) {
+		return nil
+	}
+	if err := runCommand("userdel", login); err != nil {
+		return fmt.Errorf("failed to delete linux user %s: %w", login, err)
+	}
+	return nil
+}
+
+func (s *socksClient) connectionConfig(u socksUser, server string, port int) (socksConnInfo, error) {
+	server = strings.TrimSpace(server)
+	if server == "" {
+		server = strings.TrimSpace(os.Getenv("PSAS_SOCKS_HOST"))
+	}
+	if server == "" {
+		ip, err := detectPublicIPv4()
+		if err != nil {
+			return socksConnInfo{}, err
+		}
+		server = ip
+	}
+	server = strings.Trim(strings.TrimSpace(server), "[]")
+	if server == "" || strings.ContainsAny(server, " \t\r\n") {
+		return socksConnInfo{}, fmt.Errorf("invalid server value: %q", server)
+	}
+
+	if port <= 0 {
+		if listen, err := s.listenAddress(); err == nil {
+			if _, p, perr := parseListenAddress(listen); perr == nil {
+				if n, aerr := strconv.Atoi(p); aerr == nil {
+					port = n
+				}
+			}
+		}
+	}
+	if port <= 0 {
+		port = defaultSocksPort
+	}
+	if port < 1 || port > 65535 {
+		return socksConnInfo{}, fmt.Errorf("invalid SOCKS port: %d", port)
+	}
+
+	uriHost := net.JoinHostPort(server, strconv.Itoa(port))
+	uri := "socks5://" + url.QueryEscape(u.Name) + ":" + url.QueryEscape(u.Password) + "@" + uriHost
+	return socksConnInfo{
+		Server:   server,
+		Port:     port,
+		Username: u.Name,
+		Password: u.Password,
+		URI:      uri,
+	}, nil
+}
+
+func parseTrustCredentials(raw string) ([]trustUser, error) {
+	lines := strings.Split(strings.ReplaceAll(raw, "\r", ""), "\n")
+	users := []trustUser{}
+
+	inClient := false
+	current := trustUser{}
+	seen := map[string]bool{}
+
+	flushCurrent := func() error {
+		if !inClient {
+			return nil
+		}
+		if strings.TrimSpace(current.Username) == "" {
+			return errors.New("client entry missing username")
+		}
+		if strings.TrimSpace(current.Password) == "" {
+			return fmt.Errorf("client %q missing password", current.Username)
+		}
+		lc := strings.ToLower(strings.TrimSpace(current.Username))
+		if seen[lc] {
+			return fmt.Errorf("duplicate username: %s", current.Username)
+		}
+		seen[lc] = true
+		users = append(users, current)
+		current = trustUser{}
+		return nil
+	}
+
+	for _, line := range lines {
+		trimmed := stripTOMLComment(line)
+		if trimmed == "" {
+			continue
+		}
+		if trimmed == "[[client]]" {
+			if err := flushCurrent(); err != nil {
+				return nil, err
+			}
+			inClient = true
+			continue
+		}
+		if !inClient {
+			continue
+		}
+		if v, ok, err := parseTOMLStringAssignment(trimmed, "username"); err != nil {
+			return nil, err
+		} else if ok {
+			current.Username = strings.TrimSpace(v)
+			continue
+		}
+		if v, ok, err := parseTOMLStringAssignment(trimmed, "password"); err != nil {
+			return nil, err
+		} else if ok {
+			current.Password = strings.TrimSpace(v)
+			continue
+		}
+	}
+	if err := flushCurrent(); err != nil {
+		return nil, err
+	}
+	sort.Slice(users, func(i, j int) bool {
+		return strings.ToLower(users[i].Username) < strings.ToLower(users[j].Username)
+	})
+	return users, nil
+}
+
+func renderTrustCredentials(users []trustUser) (string, error) {
+	for _, u := range users {
+		if err := validateTrustUsername(u.Username); err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(u.Password) == "" {
+			return "", fmt.Errorf("password is empty for user %s", u.Username)
+		}
+	}
+	sort.Slice(users, func(i, j int) bool {
+		return strings.ToLower(users[i].Username) < strings.ToLower(users[j].Username)
+	})
+
+	var b strings.Builder
+	for i, u := range users {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("[[client]]\n")
+		b.WriteString("username = ")
+		b.WriteString(strconv.Quote(strings.TrimSpace(u.Username)))
+		b.WriteString("\n")
+		b.WriteString("password = ")
+		b.WriteString(strconv.Quote(strings.TrimSpace(u.Password)))
+		b.WriteString("\n")
+	}
+	return b.String(), nil
+}
+
+func resolveTrustUser(users []trustUser, id string) (trustUser, int, error) {
+	key := strings.TrimSpace(id)
+	if key == "" {
+		return trustUser{}, -1, errors.New("empty USER_ID")
+	}
+	var exactIdx []int
+	for i, u := range users {
+		if strings.EqualFold(strings.TrimSpace(u.Username), key) {
+			exactIdx = append(exactIdx, i)
+		}
+	}
+	if len(exactIdx) == 1 {
+		idx := exactIdx[0]
+		return users[idx], idx, nil
+	}
+	if len(exactIdx) > 1 {
+		return trustUser{}, -1, fmt.Errorf("multiple users have name %q", key)
+	}
+
+	lcKey := strings.ToLower(key)
+	var partialIdx []int
+	for i, u := range users {
+		if strings.Contains(strings.ToLower(u.Username), lcKey) {
+			partialIdx = append(partialIdx, i)
+		}
+	}
+	if len(partialIdx) == 1 {
+		idx := partialIdx[0]
+		return users[idx], idx, nil
+	}
+	if len(partialIdx) == 0 {
+		return trustUser{}, -1, fmt.Errorf("trust user not found: %s", key)
+	}
+	return trustUser{}, -1, fmt.Errorf("multiple trust users match %q", key)
+}
+
+func hasTrustUserExact(users []trustUser, username string) bool {
+	for _, u := range users {
+		if strings.EqualFold(strings.TrimSpace(u.Username), strings.TrimSpace(username)) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateTrustUsername(username string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("trust username is required")
+	}
+	if !trustUserRe.MatchString(username) {
+		return fmt.Errorf("invalid trust username %q (allowed: A-Z a-z 0-9 . _ @ -)", username)
+	}
+	return nil
+}
+
+func normalizeSocksLogin(login string) string {
+	return strings.ToLower(strings.TrimSpace(login))
+}
+
+func validateSocksLogin(login string) error {
+	login = normalizeSocksLogin(login)
+	if login == "" {
+		return errors.New("socks login is required")
+	}
+	if !socksUserRe.MatchString(login) {
+		return fmt.Errorf("invalid socks login %q (allowed: lowercase linux login, e.g. user01)", login)
+	}
+	return nil
+}
+
+func socksSystemUser(u socksUser) string {
+	if strings.TrimSpace(u.SystemUser) != "" {
+		return strings.TrimSpace(u.SystemUser)
+	}
+	return normalizeSocksLogin(u.Name)
+}
+
+func hasSocksUserExact(users []socksUser, login string) bool {
+	login = normalizeSocksLogin(login)
+	for _, u := range users {
+		if normalizeSocksLogin(u.Name) == login {
+			return true
+		}
+	}
+	return false
+}
+
+func findSocksUserIndex(users []socksUser, login string) int {
+	login = normalizeSocksLogin(login)
+	for i, u := range users {
+		if normalizeSocksLogin(u.Name) == login {
+			return i
+		}
+	}
+	return -1
+}
+
+func resolveSocksUser(users []socksUser, id string) (socksUser, int, error) {
+	key := normalizeSocksLogin(id)
+	if key == "" {
+		return socksUser{}, -1, errors.New("empty USER_ID")
+	}
+	var exactIdx []int
+	for i, u := range users {
+		if normalizeSocksLogin(u.Name) == key {
+			exactIdx = append(exactIdx, i)
+		}
+	}
+	if len(exactIdx) == 1 {
+		idx := exactIdx[0]
+		return users[idx], idx, nil
+	}
+	if len(exactIdx) > 1 {
+		return socksUser{}, -1, fmt.Errorf("multiple socks users have name %q", key)
+	}
+
+	var partialIdx []int
+	for i, u := range users {
+		if strings.Contains(normalizeSocksLogin(u.Name), key) {
+			partialIdx = append(partialIdx, i)
+		}
+	}
+	if len(partialIdx) == 1 {
+		idx := partialIdx[0]
+		return users[idx], idx, nil
+	}
+	if len(partialIdx) == 0 {
+		return socksUser{}, -1, fmt.Errorf("socks user not found: %s", key)
+	}
+	return socksUser{}, -1, fmt.Errorf("multiple socks users match %q", key)
+}
+
+func osSocksUserExists(login string) bool {
+	login = normalizeSocksLogin(login)
+	if login == "" {
+		return false
+	}
+	_, err := runCommandOutput("id", "-u", login)
+	return err == nil
+}
+
+func requireRoot(action string) error {
+	if os.Geteuid() == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s requires root (run with sudo)", action)
+}
+
+func parseTOMLStringKey(raw, key string) (string, bool, error) {
+	lines := strings.Split(strings.ReplaceAll(raw, "\r", ""), "\n")
+	for _, line := range lines {
+		trimmed := stripTOMLComment(line)
+		if trimmed == "" {
+			continue
+		}
+		v, ok, err := parseTOMLStringAssignment(trimmed, key)
+		if err != nil {
+			return "", false, err
+		}
+		if ok {
+			return v, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func parseTOMLStringAssignment(line, key string) (string, bool, error) {
+	parts := strings.SplitN(line, "=", 2)
+	if len(parts) != 2 {
+		return "", false, nil
+	}
+	k := strings.TrimSpace(parts[0])
+	if k != key {
+		return "", false, nil
+	}
+	rawValue := strings.TrimSpace(parts[1])
+	v, err := strconv.Unquote(rawValue)
+	if err != nil {
+		return "", false, fmt.Errorf("invalid TOML string for %s: %s", key, rawValue)
+	}
+	return v, true, nil
+}
+
+func stripTOMLComment(line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return ""
+	}
+	inString := false
+	escaped := false
+	for i, ch := range line {
+		switch {
+		case ch == '\\' && inString && !escaped:
+			escaped = true
+			continue
+		case ch == '"' && !escaped:
+			inString = !inString
+		case ch == '#' && !inString:
+			return strings.TrimSpace(line[:i])
+		}
+		escaped = false
+	}
+	return strings.TrimSpace(line)
+}
+
+func parseListenAddress(addr string) (string, string, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", "", errors.New("empty address")
+	}
+	idx := strings.LastIndex(addr, ":")
+	if idx <= 0 || idx >= len(addr)-1 {
+		return "", "", fmt.Errorf("invalid address: %s", addr)
+	}
+	host := strings.TrimSpace(addr[:idx])
+	port := strings.TrimSpace(addr[idx+1:])
+	p, err := strconv.Atoi(port)
+	if err != nil || p <= 0 || p > 65535 {
+		return "", "", fmt.Errorf("invalid port in address: %s", addr)
+	}
+	host = strings.Trim(host, "[]")
+	return host, port, nil
+}
+
+func detectPublicIPv4() (string, error) {
+	if envIP := strings.TrimSpace(os.Getenv("PSAS_PUBLIC_IP")); envIP != "" {
+		if isIPv4(envIP) {
+			return envIP, nil
+		}
+		return "", fmt.Errorf("PSAS_PUBLIC_IP is not valid IPv4: %s", envIP)
+	}
+
+	if out, err := runCommandOutput("curl", "-4", "-fsSL", "--max-time", "4", "https://api.ipify.org"); err == nil {
+		ip := strings.TrimSpace(out)
+		if isIPv4(ip) {
+			return ip, nil
+		}
+	}
+
+	if out, err := runCommandOutput("ip", "-4", "route", "get", "1.1.1.1"); err == nil {
+		fields := strings.Fields(out)
+		for i := 0; i < len(fields)-1; i++ {
+			if fields[i] == "src" && isIPv4(fields[i+1]) {
+				return fields[i+1], nil
+			}
+		}
+	}
+
+	return "", errors.New("unable to detect public IPv4 automatically; pass --address <ip:port> or set PSAS_PUBLIC_IP")
+}
+
+func newSecureToken(length int) string {
+	if length <= 0 {
+		length = 24
+	}
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	raw := make([]byte, length)
+	mustReadRand(raw)
+	out := make([]byte, length)
+	for i, b := range raw {
+		out[i] = alphabet[int(b)%len(alphabet)]
+	}
+	return string(out)
 }
 
 func (c *client) loadState() error {
@@ -2965,7 +5966,14 @@ func promptLine(in *bufio.Reader, label, def string) (string, error) {
 		fmt.Printf("%s: ", label)
 	}
 	s, err := in.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return "", io.EOF
+			}
+			return s, nil
+		}
 		return "", err
 	}
 	s = strings.TrimSpace(s)
@@ -3193,6 +6201,20 @@ func runCommand(bin string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+func runCommandOutput(bin string, args ...string) (string, error) {
+	cmd := exec.Command(bin, args...)
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+func runCommandInput(input, bin string, args ...string) error {
+	cmd := exec.Command(bin, args...)
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 

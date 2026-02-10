@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.2.0"
 
 info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*"; }
@@ -33,7 +33,7 @@ is_port() {
 install_prereqs() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl jq openssl ufw fail2ban ca-certificates uuid-runtime
+  apt-get install -y curl jq openssl ufw fail2ban ca-certificates uuid-runtime python3
 }
 
 install_hiddify_if_needed() {
@@ -56,6 +56,28 @@ wait_hiddify() {
   done
   err "Hiddify panel config not found: /opt/hiddify-manager/hiddify-panel/app.cfg"
   exit 1
+}
+
+install_trusttunnel_if_needed() {
+  if [[ "${INSTALL_TRUSTTUNNEL:-no}" != "yes" ]]; then
+    return
+  fi
+  if [[ -x /opt/trusttunnel/trusttunnel_endpoint ]]; then
+    info "TrustTunnel detected in /opt/trusttunnel"
+    return
+  fi
+
+  info "TrustTunnel not found. Installing latest TrustTunnel endpoint..."
+  curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s - -a y
+}
+
+setup_trusttunnel_reload_cron() {
+  cat >/etc/cron.d/reload-trusttunnel-cert <<'EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+41 3 * * * root systemctl restart trusttunnel.service >/dev/null 2>&1 || true
+EOF
+  chmod 0644 /etc/cron.d/reload-trusttunnel-cert
 }
 
 detect_panel_python() {
@@ -849,6 +871,97 @@ EOF
   chmod 0755 /usr/local/bin/hiddify-sub
 }
 
+write_trusttunnel_sub_script() {
+  cat >/usr/local/bin/trusttunnel-sub <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v psasctl >/dev/null 2>&1; then
+  exec psasctl trust "$@"
+fi
+
+cat >&2 <<'TXT'
+trusttunnel-sub requires psasctl in PATH.
+Build and install psasctl from the PSAS repository, then retry:
+  cd /tmp/PSAS
+  go build -o psasctl ./cmd/psasctl
+  sudo install -m 0755 psasctl /usr/local/bin/psasctl
+TXT
+exit 1
+EOF
+  chmod 0755 /usr/local/bin/trusttunnel-sub
+}
+
+configure_trusttunnel_endpoint() {
+  if [[ "${INSTALL_TRUSTTUNNEL:-no}" != "yes" ]]; then
+    return
+  fi
+
+  [[ -x /opt/trusttunnel/setup_wizard ]] || { err "TrustTunnel setup_wizard not found in /opt/trusttunnel"; exit 1; }
+  [[ -x /opt/trusttunnel/trusttunnel_endpoint ]] || { err "TrustTunnel endpoint binary not found in /opt/trusttunnel"; exit 1; }
+
+  if [[ -z "${TRUSTTUNNEL_PASS:-}" ]]; then
+    TRUSTTUNNEL_PASS="$(random_alnum 24)"
+  fi
+
+  info "Configuring TrustTunnel endpoint on port ${TRUSTTUNNEL_PORT}"
+
+  (
+    cd /opt/trusttunnel
+    ./setup_wizard -m non-interactive \
+      -a "0.0.0.0:${TRUSTTUNNEL_PORT}" \
+      -c "${TRUSTTUNNEL_USER}:${TRUSTTUNNEL_PASS}" \
+      -n "${TRUSTTUNNEL_DOMAIN}" \
+      --lib-settings vpn.toml \
+      --hosts-settings hosts.toml \
+      --cert-type self-signed
+  )
+
+  TRUSTTUNNEL_CERT_MODE="self-signed"
+  if [[ -s "/etc/letsencrypt/live/${TRUSTTUNNEL_DOMAIN}/fullchain.pem" && -s "/etc/letsencrypt/live/${TRUSTTUNNEL_DOMAIN}/privkey.pem" ]]; then
+    cat >/opt/trusttunnel/hosts.toml <<EOF
+ping_hosts = []
+speedtest_hosts = []
+reverse_proxy_hosts = []
+
+[[main_hosts]]
+hostname = "${TRUSTTUNNEL_DOMAIN}"
+cert_chain_path = "/etc/letsencrypt/live/${TRUSTTUNNEL_DOMAIN}/fullchain.pem"
+private_key_path = "/etc/letsencrypt/live/${TRUSTTUNNEL_DOMAIN}/privkey.pem"
+allowed_sni = []
+EOF
+    TRUSTTUNNEL_CERT_MODE="letsencrypt"
+    setup_trusttunnel_reload_cron
+  else
+    rm -f /etc/cron.d/reload-trusttunnel-cert
+  fi
+
+  cp /opt/trusttunnel/trusttunnel.service.template /etc/systemd/system/trusttunnel.service
+  systemctl daemon-reload
+  systemctl enable --now trusttunnel.service
+
+  cat >/root/trusttunnel-credentials.txt <<EOF
+TrustTunnel endpoint credentials
+username=${TRUSTTUNNEL_USER}
+password=${TRUSTTUNNEL_PASS}
+domain=${TRUSTTUNNEL_DOMAIN}
+listen_port=${TRUSTTUNNEL_PORT}
+certificate_mode=${TRUSTTUNNEL_CERT_MODE}
+EOF
+  chmod 0600 /root/trusttunnel-credentials.txt
+
+  TRUSTTUNNEL_PUBLIC_IP="$(curl -4 -fsSL https://api.ipify.org 2>/dev/null || true)"
+  if [[ "${TRUSTTUNNEL_PUBLIC_IP}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    (
+      cd /opt/trusttunnel
+      ./trusttunnel_endpoint vpn.toml hosts.toml -c "${TRUSTTUNNEL_USER}" -a "${TRUSTTUNNEL_PUBLIC_IP}:${TRUSTTUNNEL_PORT}" > /root/trusttunnel-endpoint-config.txt
+    ) || true
+    if [[ -s /root/trusttunnel-endpoint-config.txt ]]; then
+      chmod 0600 /root/trusttunnel-endpoint-config.txt
+    fi
+  fi
+}
+
 configure_domains() {
   PSAS_MAIN_DOMAIN="$MAIN_DOMAIN" PSAS_REALITY_SNI="$REALITY_SNI" hp_python <<'PY'
 import os,sys
@@ -1000,6 +1113,7 @@ EOF
 
 configure_ufw() {
   local hy2_port="$1"
+  local trust_port="${2:-}"
   ufw allow 22/tcp || true
   ufw allow 80/tcp || true
   ufw allow 443/tcp || true
@@ -1007,10 +1121,17 @@ configure_ufw() {
   if [[ -n "$hy2_port" ]]; then
     ufw allow "${hy2_port}/udp" || true
   fi
+  if [[ -n "$trust_port" ]]; then
+    ufw allow "${trust_port}/tcp" || true
+    ufw allow "${trust_port}/udp" || true
+  fi
 
   yes | ufw delete allow 1945 2>/dev/null || true
   yes | ufw delete allow 1945/tcp 2>/dev/null || true
-  yes | ufw delete allow 8443/tcp 2>/dev/null || true
+  if [[ -z "$trust_port" || "$trust_port" != "8443" ]]; then
+    yes | ufw delete allow 8443/tcp 2>/dev/null || true
+    yes | ufw delete allow 8443/udp 2>/dev/null || true
+  fi
 
   if ! ufw status | grep -q '^Status: active'; then
     warn "UFW inactive. Enabling with defaults deny incoming / allow outgoing"
@@ -1051,6 +1172,16 @@ print_summary() {
   echo "Admin password: ${ADMIN_PASS}"
   echo "Client path: ${CLIENT_PATH}"
   echo "Hysteria2 UDP port: ${HY2_PORT}"
+  if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" ]]; then
+    echo "TrustTunnel domain: ${TRUSTTUNNEL_DOMAIN}"
+    echo "TrustTunnel port: ${TRUSTTUNNEL_PORT}"
+    echo "TrustTunnel cert mode: ${TRUSTTUNNEL_CERT_MODE:-self-signed}"
+    echo "TrustTunnel username: ${TRUSTTUNNEL_USER}"
+    echo "TrustTunnel password: ${TRUSTTUNNEL_PASS}"
+    if [[ -s /root/trusttunnel-endpoint-config.txt ]]; then
+      echo "TrustTunnel config file: /root/trusttunnel-endpoint-config.txt"
+    fi
+  fi
   echo
   echo "User management commands:"
   echo "  hiddify-sub list"
@@ -1059,6 +1190,16 @@ print_summary() {
   echo "  hiddify-sub add --name user01 --true-unlimited --mode no_reset"
   echo "  hiddify-sub protocols enable hysteria2"
   echo "  hiddify-sub show <USER_ID>"
+  if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" ]]; then
+    echo
+    echo "TrustTunnel management commands:"
+    echo "  psasctl trust status"
+    echo "  psasctl trust users list"
+    echo "  psasctl trust users add --name user01 --show-config"
+    echo "  psasctl trust users show user01 --show-config"
+    echo "  psasctl trust users del user01"
+    echo "  psasctl trust service restart"
+  fi
   echo
   echo "Apply config safely after manual edits:"
   echo "  hiddify-apply-safe ${MAIN_DOMAIN}"
@@ -1126,6 +1267,47 @@ prompt_inputs() {
     err "DO_CLEANUP must be yes or no"
     exit 1
   fi
+
+  read -r -p "Install TrustTunnel endpoint too? [yes/no, default yes]: " INSTALL_TRUSTTUNNEL
+  INSTALL_TRUSTTUNNEL="${INSTALL_TRUSTTUNNEL:-yes}"
+  if [[ "$INSTALL_TRUSTTUNNEL" != "yes" && "$INSTALL_TRUSTTUNNEL" != "no" ]]; then
+    err "INSTALL_TRUSTTUNNEL must be yes or no"
+    exit 1
+  fi
+
+  if [[ "$INSTALL_TRUSTTUNNEL" == "yes" ]]; then
+    read -r -p "TrustTunnel domain [${MAIN_DOMAIN}]: " TRUSTTUNNEL_DOMAIN
+    TRUSTTUNNEL_DOMAIN="${TRUSTTUNNEL_DOMAIN:-$MAIN_DOMAIN}"
+    if ! is_domain "$TRUSTTUNNEL_DOMAIN"; then
+      err "Invalid TrustTunnel domain: $TRUSTTUNNEL_DOMAIN"
+      exit 1
+    fi
+
+    read -r -p "TrustTunnel listen port [8443]: " TRUSTTUNNEL_PORT
+    TRUSTTUNNEL_PORT="${TRUSTTUNNEL_PORT:-8443}"
+    if ! is_port "$TRUSTTUNNEL_PORT"; then
+      err "Invalid TrustTunnel port"
+      exit 1
+    fi
+    if [[ "$TRUSTTUNNEL_PORT" == "80" || "$TRUSTTUNNEL_PORT" == "443" ]]; then
+      err "TrustTunnel port ${TRUSTTUNNEL_PORT} conflicts with Hiddify web ports 80/443"
+      exit 1
+    fi
+    if [[ "$TRUSTTUNNEL_PORT" == "$HYSTERIA_BASE_PORT" || "$TRUSTTUNNEL_PORT" == "$SPECIAL_BASE_PORT" ]]; then
+      err "TrustTunnel port ${TRUSTTUNNEL_PORT} conflicts with Hiddify configured ports"
+      exit 1
+    fi
+
+    read -r -p "TrustTunnel initial username [ttadmin]: " TRUSTTUNNEL_USER
+    TRUSTTUNNEL_USER="${TRUSTTUNNEL_USER:-ttadmin}"
+    if ! [[ "$TRUSTTUNNEL_USER" =~ ^[A-Za-z0-9._@-]{1,64}$ ]]; then
+      err "TrustTunnel username must match [A-Za-z0-9._@-]{1,64}"
+      exit 1
+    fi
+
+    read -r -s -p "TrustTunnel initial password [auto-generated if empty]: " TRUSTTUNNEL_PASS
+    echo
+  fi
 }
 
 main() {
@@ -1137,6 +1319,7 @@ main() {
   wait_hiddify
   detect_panel_python
   backup_hiddify
+  install_trusttunnel_if_needed
 
   if [[ "$DO_CLEANUP" == "yes" ]]; then
     cleanup_legacy
@@ -1145,6 +1328,9 @@ main() {
   write_sync_cert_script
   write_apply_safe_script
   write_hiddify_sub_script
+  if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" ]]; then
+    write_trusttunnel_sub_script
+  fi
   setup_cert_sync_cron
 
   configure_panel_settings
@@ -1156,8 +1342,9 @@ main() {
   /usr/local/sbin/sync-hiddify-cert.sh "$MAIN_DOMAIN" || true
 
   collect_state
+  configure_trusttunnel_endpoint
 
-  configure_ufw "$HY2_PORT"
+  configure_ufw "$HY2_PORT" "${TRUSTTUNNEL_PORT:-}"
   configure_fail2ban
   configure_sysctl
 

@@ -57,6 +57,28 @@ psasctl protocols disable --apply tuic vmess
 psasctl apply
 # или
 hiddify-apply-safe <your-domain>
+
+# TrustTunnel
+psasctl trust status
+psasctl trust users list
+psasctl trust users add --name tt-user01 --show-config
+psasctl trust users show tt-user01 --show-config
+psasctl trust users edit tt-user01 --password 'newStrongPass'
+psasctl trust users del tt-user01
+psasctl trust users config tt-user01 --out /root/tt-user01.toml
+psasctl trust service restart
+psasctl trust ui
+
+# SOCKS5 (Dante)
+psasctl socks status
+psasctl socks users list
+psasctl socks users add --name socks01 --show-config --server vpn.example.com
+psasctl socks users show --show-config --server vpn.example.com socks01
+psasctl socks users edit socks01 --password 'newStrongPass'
+psasctl socks users del socks01
+psasctl socks users config --server vpn.example.com socks01
+psasctl socks service restart
+psasctl socks ui
 ```
 
 Примечание:
@@ -78,7 +100,9 @@ hiddify-apply-safe <your-domain>
 - clean-screen интерфейс (экран очищается при смене шага),
 - выбор пунктов стрелками `↑/↓` (или `j/k`) и `Enter`,
 - быстрый выбор по номеру (`1-9`) и hotkeys пунктов,
-- есть `Flag command wizard`: пошаговая сборка стандартных команд (`status/users/config/apply`) с запуском через тот же `psasctl`, чтобы сохранить исходную обработку флагов,
+- есть `Flag command wizard`: пошаговая сборка стандартных команд (`status/users/config/apply/trust/socks`) с запуском через тот же `psasctl`, чтобы сохранить исходную обработку флагов,
+- есть отдельный раздел `TrustTunnel` для управления пользователями и сервисом,
+- есть отдельный раздел `SOCKS5 (Dante)` для управления логинами SOCKS5 и сервисом danted,
 - в операциях `Show/Delete` есть стрелочный выбор пользователя с фильтром по вводу и ручным вводом `USER_ID`,
 - в `Add user` режим (`no_reset|daily|weekly|monthly`) выбирается стрелками, есть опции безлимита по трафику и/или времени,
 - для операций с параметрами утилита запросит нужные поля по шагам,
