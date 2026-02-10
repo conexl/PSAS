@@ -34,6 +34,9 @@ const (
 	defaultSocksConfig   = "/etc/danted.conf"
 	defaultSocksUsers    = "/etc/psas/socks-users.json"
 	defaultSocksPort     = 1080
+	defaultUILang        = "us"
+	uiLangUS             = "us"
+	uiLangRU             = "ru"
 	unlimitedPackageDays = 10000
 	unlimitedUsageGB     = 1000000.0
 )
@@ -130,6 +133,10 @@ type socksConnInfo struct {
 	URI      string `json:"uri"`
 }
 
+type uiSettings struct {
+	Lang string `json:"lang"`
+}
+
 type protocolSetting struct {
 	Name    string
 	Key     string
@@ -166,8 +173,180 @@ var ansiRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 var errUISelectionCanceled = errors.New("selection canceled")
 var errUIExitRequested = errors.New("exit requested")
 var errUIManualEntry = errors.New("manual entry requested")
+var currentUILang = defaultUILang
+var uiTextRU = map[string]string{
+	"Language":                   "Язык",
+	"Language set to: %s":        "Язык установлен: %s",
+	"Current language: %s":       "Текущий язык: %s",
+	"Supported: us, ru":          "Поддерживается: us, ru",
+	"PSASCTL - Interactive Menu": "PSASCTL - Интерактивное меню",
+	"Controls: Up/Down or j/k to navigate, Enter to select, q to quit": "Управление: Up/Down или j/k, Enter выбрать, q выйти",
+	"Quick select: Press number 1-9 or shortcut key":                   "Быстрый выбор: нажмите 1-9 или горячую клавишу",
+	"Controls: Up/Down or j/k, Enter to select, q to cancel":           "Управление: Up/Down или j/k, Enter выбрать, q отмена",
+	"Press Enter to return to menu (q to exit)...":                     "Нажмите Enter для возврата в меню (q для выхода)...",
+	"Select command to build":                                          "Выберите команду для сборки",
+	"Run this command?":                                                "Запустить эту команду?",
+	"Canceled.":                                                        "Отменено.",
+	"ERROR":                                                            "ОШИБКА",
+	"Exit":                                                             "Выход",
+	"Back":                                                             "Назад",
+	"Status":                                                           "Статус",
+	"List users":                                                       "Список пользователей",
+	"Find users":                                                       "Поиск пользователей",
+	"Show user + links":                                                "Пользователь + ссылки",
+	"Add user":                                                         "Добавить пользователя",
+	"Edit user":                                                        "Изменить пользователя",
+	"Delete user":                                                      "Удалить пользователя",
+	"Protocols":                                                        "Протоколы",
+	"Admin URL":                                                        "Ссылка админки",
+	"Apply config":                                                     "Применить конфиг",
+	"Flag command wizard":                                              "Мастер флаговых команд",
+	"SOCKS5 (Dante)":                                                   "SOCKS5 (Dante)",
+	"TrustTunnel":                                                      "TrustTunnel",
+	"Main domain, admin URL, protocols, users count":                    "Основной домен, админ URL, протоколы, количество пользователей",
+	"Print all users in a table":                                        "Показать всех пользователей в таблице",
+	"Search users by name/part and optional enabled filter":             "Поиск пользователей по имени/части и фильтру enabled",
+	"Pick a user with arrows and print links":                           "Выберите пользователя стрелками и покажите ссылки",
+	"Step-by-step wizard for creating a user":                           "Пошаговый мастер создания пользователя",
+	"Pick a user and edit name/limits/mode/enabled state":               "Выберите пользователя и измените имя/лимиты/режим/статус",
+	"Pick a user and delete with confirmation":                          "Выберите пользователя и удалите с подтверждением",
+	"Manage SOCKS users and danted service":                             "Управление SOCKS-пользователями и сервисом danted",
+	"Manage TrustTunnel users and service":                              "Управление пользователями TrustTunnel и сервисом",
+	"List and toggle protocol enable flags":                             "Список и переключение флагов протоколов",
+	"Print panel admin URL":                                             "Показать URL админ-панели",
+	"Run hiddify-apply-safe or panel apply":                             "Запустить hiddify-apply-safe или panel apply",
+	"Build and run existing psasctl commands with their original flags": "Собрать и запустить существующие команды psasctl с исходными флагами",
+	"Leave interactive mode":                                            "Выйти из интерактивного режима",
+	"Language and UI preferences":                                       "Язык и параметры интерфейса",
+	"\nEnter option number (1-%d)":                                      "\nВведите номер пункта (1-%d)",
+	"\nEnter option number":                                             "\nВведите номер пункта",
+	"Invalid. Enter 1-%d or q":                                          "Неверно. Введите 1-%d или q",
+	"Invalid. Enter 0-%d or q":                                          "Неверно. Введите 0-%d или q",
+	"Value is required.":                                                "Значение обязательно.",
+	"No users match current filter":                                     "Нет пользователей по текущему фильтру",
+	"Filter: %s":                                                        "Фильтр: %s",
+	"Showing: %d / %d users":                                            "Показано: %d / %d пользователей",
+	"(Showing %d-%d of %d)":                                             "(Показано %d-%d из %d)",
+	"Controls: Up/Down to navigate, Enter to select, Type to filter":    "Управление: Up/Down для выбора, Enter подтвердить, печатайте для фильтра",
+	"          Backspace to erase, i for manual input, q to cancel":     "          Backspace удалить, i для ручного ввода, q отмена",
+	"  0. Manual USER_ID input":                                         "  0. Ручной ввод USER_ID",
+	"  q. Cancel":                                                       "  q. Отмена",
+	"  q. Exit":                                                         "  q. Выход",
+	"Enter user number":                                                 "Введите номер пользователя",
+	"Use --json output?":                                                "Использовать --json вывод?",
+	"Command":                                                           "Команда",
+	"Invalid value: %v":                                                 "Неверное значение: %v",
+	"SOCKS5 status":                                                     "Статус SOCKS5",
+	"SOCKS users":                                                       "SOCKS пользователи",
+	"SOCKS service":                                                     "Сервис SOCKS",
+	"TrustTunnel status":                                                "Статус TrustTunnel",
+	"TrustTunnel users":                                                 "Пользователи TrustTunnel",
+	"System Status":                                                     "Системный статус",
+	"SOCKS5 config":                                                     "Конфиг SOCKS5",
+	"SOCKS User":                                                        "SOCKS пользователь",
+	"TrustTunnel User":                                                  "Пользователь TrustTunnel",
+	"status":                                                            "статус",
+	"start":                                                             "запуск",
+	"stop":                                                              "остановка",
+	"restart":                                                           "перезапуск",
+	"back":                                                              "назад",
+	"TrustTunnel installed":                                             "TrustTunnel установлен",
+	"SOCKS installed":                                                   "SOCKS установлен",
+	"Service":                                                           "Сервис",
+	"Directory":                                                         "Каталог",
+	"Config":                                                            "Конфиг",
+	"Listen":                                                            "Слушает",
+	"Hostname":                                                          "Хостнейм",
+	"Users":                                                             "Пользователи",
+	"Main domain":                                                       "Основной домен",
+	"Client path":                                                       "Путь клиента",
+	"Reality enabled":                                                   "Reality включен",
+	"Hysteria2 enabled":                                                 "Hysteria2 включен",
+	"Hysteria base port":                                                "Базовый порт Hysteria",
+	"Reality SNI":                                                       "Reality SNI",
+	"TrustTunnel active":                                                "TrustTunnel активен",
+	"TrustTunnel listen":                                                "TrustTunnel слушает",
+	"SOCKS active":                                                      "SOCKS активен",
+	"SOCKS listen":                                                      "SOCKS слушает",
+	"No users found.":                                                   "Пользователи не найдены.",
+	"User created successfully!":                                        "Пользователь успешно создан!",
+	"USERNAME":                                                          "ПОЛЬЗОВАТЕЛЬ",
+	"PASSWORD":                                                          "ПАРОЛЬ",
+	"LOGIN":                                                             "ЛОГИН",
+	"Server":                                                            "Сервер",
+	"Port":                                                              "Порт",
+	"Login":                                                             "Логин",
+	"Password":                                                          "Пароль",
+	"Username":                                                          "Имя пользователя",
+	"Service control":                                                   "Управление сервисом",
+	"Status / users / links / settings":                                 "Статус / пользователи / ссылки / настройки",
+	"Show SOCKS service/config summary":                                 "Показать статус SOCKS сервиса и конфига",
+	"Show SOCKS logins and masked passwords":                            "Показать SOCKS логины и скрытые пароли",
+	"Create SOCKS login and set Linux password":                         "Создать SOCKS логин и установить Linux пароль",
+	"Rename login and/or change password":                               "Переименовать логин и/или сменить пароль",
+	"Show login/password and optional connect params":   "Показать логин/пароль и опциональные параметры подключения",
+	"Remove SOCKS login and Linux user":                 "Удалить SOCKS логин и Linux пользователя",
+	"status/start/stop/restart danted":                  "status/start/stop/restart danted",
+	"Return to SOCKS menu":                              "Вернуться в меню SOCKS",
+	"SOCKS login":                                       "SOCKS логин",
+	"SOCKS user added: %s":                              "SOCKS пользователь добавлен: %s",
+	"Print connection config now?":                      "Показать конфиг подключения сейчас?",
+	"Server host/ip (empty = auto detect)":              "Сервер host/ip (пусто = автоопределение)",
+	"Port (empty = from danted config)":                 "Порт (пусто = из конфига danted)",
+	"invalid port: %s":                                  "неверный порт: %s",
+	"Select SOCKS user to edit":                         "Выберите SOCKS пользователя для изменения",
+	"selected user not found: %s":                       "выбранный пользователь не найден: %s",
+	"New login (empty = keep: %s)":                      "Новый логин (пусто = оставить: %s)",
+	"socks user already exists: %s":                     "socks пользователь уже существует: %s",
+	"linux user already exists: %s":                     "linux пользователь уже существует: %s",
+	"New password (empty = keep current)":               "Новый пароль (пусто = оставить текущий)",
+	"No changes requested.":                             "Изменений не запрошено.",
+	"SOCKS user updated: %s -> %s":                      "SOCKS пользователь обновлен: %s -> %s",
+	"Select SOCKS user":                                 "Выберите SOCKS пользователя",
+	"Print connection config?":                          "Показать конфиг подключения?",
+	"Select SOCKS user to delete":                       "Выберите SOCKS пользователя для удаления",
+	"Delete SOCKS user %s? (yes/no)":                    "Удалить SOCKS пользователя %s? (yes/no)",
+	"Deleted SOCKS user: %s":                            "SOCKS пользователь удален: %s",
+	"Show systemctl status":                             "Показать статус systemctl",
+	"Start service":                                     "Запустить сервис",
+	"Stop service":                                      "Остановить сервис",
+	"Restart service":                                   "Перезапустить сервис",
+	"SOCKS service %s: %s":                              "SOCKS сервис %s: %s",
+	"unknown socks action: %s":                          "неизвестное действие socks: %s",
+	"Show TrustTunnel service/config summary":           "Показать статус сервиса и конфига TrustTunnel",
+	"Show users from credentials.toml":                  "Показать пользователей из credentials.toml",
+	"Create TrustTunnel user and restart service":       "Создать пользователя TrustTunnel и перезапустить сервис",
+	"Rename user and/or change password":                "Переименовать пользователя и/или сменить пароль",
+	"Show username/password and optional client config": "Показать логин/пароль и опциональный клиентский конфиг",
+	"Remove user and restart service":                   "Удалить пользователя и перезапустить сервис",
+	"status/start/stop/restart trusttunnel":             "status/start/stop/restart trusttunnel",
+	"Trust username":                                    "Логин Trust",
+	"trust user already exists: %s":                     "trust пользователь уже существует: %s",
+	"TrustTunnel user added: %s":                        "Пользователь TrustTunnel добавлен: %s",
+	"Generate client config now?":                       "Сгенерировать клиентский конфиг сейчас?",
+	"Address ip[:port] (empty = auto detect)":           "Адрес ip[:port] (пусто = автоопределение)",
+	"Auto address detection failed: %v":                 "Автоопределение адреса не удалось: %v",
+	"Address ip[:port] (manual)":                        "Адрес ip[:port] (вручную)",
+	"Address: %s":                                       "Адрес: %s",
+	"Select TrustTunnel user to edit":                   "Выберите пользователя TrustTunnel для изменения",
+	"New username (empty = keep: %s)":                   "Новый логин (пусто = оставить: %s)",
+	"TrustTunnel user updated: %s":                      "Пользователь TrustTunnel обновлен: %s",
+	"Select TrustTunnel user":                           "Выберите пользователя TrustTunnel",
+	"Generate client config?":                           "Сгенерировать клиентский конфиг?",
+	"Select TrustTunnel user to delete":                 "Выберите пользователя TrustTunnel для удаления",
+	"Delete trust user %s? (yes/no)":                    "Удалить trust пользователя %s? (yes/no)",
+	"Deleted trust user: %s":                            "Trust пользователь удален: %s",
+	"TrustTunnel service":                               "Сервис TrustTunnel",
+	"Return to TrustTunnel menu":                        "Вернуться в меню TrustTunnel",
+	"TrustTunnel service %s: %s":                        "Сервис TrustTunnel %s: %s",
+	"unknown trust action: %s":                          "неизвестное действие trust: %s",
+	"unknown action: %s":                                "неизвестное действие: %s",
+	"Warning: %s":                                       "Внимание: %s",
+}
 
 func main() {
+	initUILanguage()
+
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
@@ -197,6 +376,8 @@ func main() {
 		runTrust(args)
 	case "socks", "socks5":
 		runSocks(args)
+	case "lang", "language":
+		runLang(args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -244,6 +425,8 @@ Usage:
   psasctl socks users del <USER_ID>
   psasctl socks service <status|start|stop|restart>
   psasctl socks ui
+  psasctl lang [show]
+  psasctl lang set <us|ru>
 
 USER_ID can be UUID or user name (exact/substring match).
 
@@ -257,6 +440,8 @@ Environment overrides:
   PSAS_SOCKS_CONF    (default /etc/danted.conf)
   PSAS_SOCKS_USERS   (default /etc/psas/socks-users.json)
   PSAS_SOCKS_HOST    (override default server host in config output)
+  PSAS_UI_LANG       (force UI language: us|ru)
+  PSAS_UI_LANG_FILE  (path to language settings file)
 `)
 }
 
@@ -1057,6 +1242,31 @@ func runSocksUI(args []string) {
 	clearScreen()
 }
 
+func runLang(args []string) {
+	if len(args) == 0 || strings.EqualFold(strings.TrimSpace(args[0]), "show") {
+		fmt.Println(currentUILang)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(args[0]), "set") {
+		if len(args) != 2 {
+			fatalf("lang set requires value: us|ru")
+		}
+		lang := normalizeUILang(args[1])
+		if lang == "" {
+			fatalf("unsupported language: %s (expected us|ru)", strings.TrimSpace(args[1]))
+		}
+		must(setUILang(lang, true))
+		fmt.Printf(uiTextf("Language set to: %s", lang) + "\n")
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(args[0]), "list") {
+		fmt.Println("us")
+		fmt.Println("ru")
+		return
+	}
+	fatalf("lang supports: show | set <us|ru> | list")
+}
+
 func runTrustUsers(tt *trustClient, args []string) {
 	if len(args) < 1 {
 		fatalf("trust users requires subcommand: list|add|edit|show|config|del")
@@ -1349,21 +1559,21 @@ func runTrustUI(args []string) {
 }
 
 func printTrustStatus(st trustStatus) {
-	fmt.Printf("TrustTunnel installed: %t\n", st.Installed)
-	fmt.Printf("Service: %s (active=%t)\n", st.Service, st.ServiceActive)
-	fmt.Printf("Directory: %s\n", st.Directory)
+	fmt.Printf("%s: %t\n", uiText("TrustTunnel installed"), st.Installed)
+	fmt.Printf("%s: %s (active=%t)\n", uiText("Service"), st.Service, st.ServiceActive)
+	fmt.Printf("%s: %s\n", uiText("Directory"), st.Directory)
 	if st.ListenAddress != "" {
-		fmt.Printf("Listen: %s\n", st.ListenAddress)
+		fmt.Printf("%s: %s\n", uiText("Listen"), st.ListenAddress)
 	}
 	if st.Hostname != "" {
-		fmt.Printf("Hostname: %s\n", st.Hostname)
+		fmt.Printf("%s: %s\n", uiText("Hostname"), st.Hostname)
 	}
-	fmt.Printf("Users: %d\n", st.Users)
+	fmt.Printf("%s: %d\n", uiText("Users"), st.Users)
 }
 
 func printTrustUsers(users []trustUser) {
 	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "USERNAME\tPASSWORD")
+	fmt.Fprintln(tw, uiText("USERNAME")+"\t"+uiText("PASSWORD"))
 	for _, u := range users {
 		fmt.Fprintf(tw, "%s\t%s\n", u.Username, maskSecret(u.Password))
 	}
@@ -1372,25 +1582,25 @@ func printTrustUsers(users []trustUser) {
 
 func printTrustUser(u trustUser) {
 	fmt.Println()
-	fmt.Println("TrustTunnel User")
+	fmt.Println(uiText("TrustTunnel User"))
 	fmt.Println("================")
-	fmt.Printf("Username: %s\n", u.Username)
-	fmt.Printf("Password: %s\n", u.Password)
+	fmt.Printf("%s: %s\n", uiText("Username"), u.Username)
+	fmt.Printf("%s: %s\n", uiText("Password"), u.Password)
 }
 
 func printSocksStatus(st socksStatus) {
-	fmt.Printf("SOCKS installed: %t\n", st.Installed)
-	fmt.Printf("Service: %s (active=%t)\n", st.Service, st.ServiceActive)
-	fmt.Printf("Config: %s\n", st.ConfigPath)
+	fmt.Printf("%s: %t\n", uiText("SOCKS installed"), st.Installed)
+	fmt.Printf("%s: %s (active=%t)\n", uiText("Service"), st.Service, st.ServiceActive)
+	fmt.Printf("%s: %s\n", uiText("Config"), st.ConfigPath)
 	if st.ListenAddress != "" {
-		fmt.Printf("Listen: %s\n", st.ListenAddress)
+		fmt.Printf("%s: %s\n", uiText("Listen"), st.ListenAddress)
 	}
-	fmt.Printf("Users: %d\n", st.Users)
+	fmt.Printf("%s: %d\n", uiText("Users"), st.Users)
 }
 
 func printSocksUsers(users []socksUser) {
 	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "LOGIN\tPASSWORD")
+	fmt.Fprintln(tw, uiText("LOGIN")+"\t"+uiText("PASSWORD"))
 	for _, u := range users {
 		fmt.Fprintf(tw, "%s\t%s\n", u.Name, maskSecret(u.Password))
 	}
@@ -1399,24 +1609,24 @@ func printSocksUsers(users []socksUser) {
 
 func printSocksUser(u socksUser) {
 	fmt.Println()
-	fmt.Println("SOCKS User")
+	fmt.Println(uiText("SOCKS User"))
 	fmt.Println("==========")
-	fmt.Printf("Login: %s\n", u.Name)
-	fmt.Printf("Password: %s\n", u.Password)
+	fmt.Printf("%s: %s\n", uiText("Login"), u.Name)
+	fmt.Printf("%s: %s\n", uiText("Password"), u.Password)
 }
 
 func renderSocksConnInfo(cfg socksConnInfo) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Server: %s\n", cfg.Server)
-	fmt.Fprintf(&b, "Port: %d\n", cfg.Port)
-	fmt.Fprintf(&b, "Login: %s\n", cfg.Username)
-	fmt.Fprintf(&b, "Password: %s\n", cfg.Password)
+	fmt.Fprintf(&b, "%s: %s\n", uiText("Server"), cfg.Server)
+	fmt.Fprintf(&b, "%s: %d\n", uiText("Port"), cfg.Port)
+	fmt.Fprintf(&b, "%s: %s\n", uiText("Login"), cfg.Username)
+	fmt.Fprintf(&b, "%s: %s\n", uiText("Password"), cfg.Password)
 	fmt.Fprintf(&b, "URI: %s\n", cfg.URI)
 	return b.String()
 }
 
 func printSocksConnInfo(cfg socksConnInfo) {
-	fmt.Println("SOCKS5 config")
+	fmt.Println(uiText("SOCKS5 config"))
 	fmt.Println("=============")
 	fmt.Print(renderSocksConnInfo(cfg))
 }
@@ -1573,6 +1783,7 @@ func runUI(args []string) {
 		{Key: "admin", Shortcut: 'u', Title: "Admin URL", Hint: "Print panel admin URL"},
 		{Key: "apply", Shortcut: 'p', Title: "Apply config", Hint: "Run hiddify-apply-safe or panel apply"},
 		{Key: "wizard", Shortcut: 'w', Title: "Flag command wizard", Hint: "Build and run existing psasctl commands with their original flags"},
+		{Key: "lang", Shortcut: 'g', Title: "Language", Hint: "Language and UI preferences"},
 		{Key: "exit", Shortcut: 'q', Title: "Exit", Hint: "Leave interactive mode"},
 	}
 
@@ -1628,6 +1839,8 @@ func runUI(args []string) {
 			}
 		case "wizard":
 			actionErr = uiRunFlagWizard(c, in)
+		case "lang":
+			actionErr = uiLanguageSettings(in)
 		default:
 			actionErr = fmt.Errorf("unknown option: %s", choice.Key)
 		}
@@ -1638,9 +1851,9 @@ func runUI(args []string) {
 				return
 			}
 			if errors.Is(actionErr, errUISelectionCanceled) {
-				fmt.Println("\nCanceled.")
+				fmt.Println("\n" + uiText("Canceled."))
 			} else {
-				fmt.Printf("\nERROR: %v\n", actionErr)
+				fmt.Printf("\n%s: %v\n", uiText("ERROR"), actionErr)
 			}
 		}
 		if handledPause {
@@ -1694,6 +1907,7 @@ type terminalState struct {
 
 // Simplified UI drawing functions
 func printBoxedHeader(title string) {
+	title = uiText(title)
 	fmt.Println()
 	fmt.Println(strings.ToUpper(title))
 	fmt.Println(strings.Repeat("=", len(title)))
@@ -1701,19 +1915,19 @@ func printBoxedHeader(title string) {
 }
 
 func printSectionHeader(title string) {
-	fmt.Printf("\n%s:\n", title)
+	fmt.Printf("\n%s:\n", uiText(title))
 }
 
 func printInfo(msg string) {
-	fmt.Printf("  %s\n", msg)
+	fmt.Printf("  %s\n", uiText(msg))
 }
 
 func printSuccess(msg string) {
-	fmt.Printf("  OK: %s\n", msg)
+	fmt.Printf("  OK: %s\n", uiText(msg))
 }
 
 func printError(msg string) {
-	fmt.Printf("  ERROR: %s\n", msg)
+	fmt.Printf("  %s: %s\n", uiText("ERROR"), uiText(msg))
 }
 
 func printSeparator() {
@@ -1796,17 +2010,17 @@ func uiSelectMenuItemFallback(items []uiMenuItem, in *bufio.Reader) (uiMenuItem,
 	clearScreen()
 
 	fmt.Println()
-	fmt.Println("PSASCTL - Interactive Menu")
+	fmt.Println(uiText("PSASCTL - Interactive Menu"))
 	fmt.Println("===========================")
 	fmt.Println()
 
 	for i, item := range items {
-		fmt.Printf("  %d. %s\n", i+1, item.Title)
+		fmt.Printf("  %d. %s\n", i+1, uiText(item.Title))
 	}
-	fmt.Println("  q. Exit")
+	fmt.Println(uiText("  q. Exit"))
 
 	for {
-		raw, err := promptRequiredLine(in, "\nEnter option number (1-"+strconv.Itoa(len(items))+")")
+		raw, err := promptRequiredLine(in, uiTextf("\nEnter option number (1-%d)", len(items)))
 		if err != nil {
 			return uiMenuItem{}, err
 		}
@@ -1816,7 +2030,7 @@ func uiSelectMenuItemFallback(items []uiMenuItem, in *bufio.Reader) (uiMenuItem,
 		}
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 || n > len(items) {
-			printError(fmt.Sprintf("Invalid. Enter 1-%d or q", len(items)))
+			printError(uiTextf("Invalid. Enter 1-%d or q", len(items)))
 			continue
 		}
 		return items[n-1], nil
@@ -1827,11 +2041,13 @@ func drawUIMenu(items []uiMenuItem, selected int) {
 	clearScreen()
 
 	fmt.Println()
-	fmt.Println("PSASCTL - Interactive Menu")
+	fmt.Println(uiText("PSASCTL - Interactive Menu"))
 	fmt.Println("===========================")
 	fmt.Println()
-	fmt.Println("Controls: Up/Down or j/k to navigate, Enter to select, q to quit")
-	fmt.Println("Quick select: Press number 1-9 or shortcut key")
+	fmt.Println(uiText("Controls: Up/Down or j/k to navigate, Enter to select, q to quit"))
+	fmt.Println(uiText("Quick select: Press number 1-9 or shortcut key"))
+	fmt.Printf("%s: %s\n", uiText("Language"), currentUILang)
+	fmt.Println(uiText("Status / users / links / settings"))
 	fmt.Println()
 
 	for i, item := range items {
@@ -1845,12 +2061,12 @@ func drawUIMenu(items []uiMenuItem, selected int) {
 			shortcut = fmt.Sprintf(" [%c]", item.Shortcut)
 		}
 
-		fmt.Printf("%s%d. %s%s\n", prefix, i+1, item.Title, shortcut)
+		fmt.Printf("%s%d. %s%s\n", prefix, i+1, uiText(item.Title), shortcut)
 	}
 
 	if selected >= 0 && selected < len(items) && items[selected].Hint != "" {
 		fmt.Println()
-		fmt.Printf("  * %s\n", items[selected].Hint)
+		fmt.Printf("  * %s\n", uiText(items[selected].Hint))
 	}
 	fmt.Println()
 }
@@ -1962,7 +2178,7 @@ func clearScreen() {
 func uiPause(in *bufio.Reader) error {
 	fmt.Println()
 	fmt.Println(strings.Repeat("-", 60))
-	fmt.Print("Press Enter to return to menu (q to exit)...")
+	fmt.Print(uiText("Press Enter to return to menu (q to exit)..."))
 	raw, err := in.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return err
@@ -1970,6 +2186,31 @@ func uiPause(in *bufio.Reader) error {
 	if strings.EqualFold(strings.TrimSpace(raw), "q") {
 		return errUIExitRequested
 	}
+	return nil
+}
+
+func uiLanguageSettings(in *bufio.Reader) error {
+	current := normalizeUILang(currentUILang)
+	if current == "" {
+		current = defaultUILang
+	}
+	defaultIdx := 0
+	if current == uiLangRU {
+		defaultIdx = 1
+	}
+	choice, err := uiSelectOptionValue("Language", []uiOption{
+		{Value: uiLangUS, Title: "us (default)", Hint: "English"},
+		{Value: uiLangRU, Title: "ru", Hint: "Русский"},
+	}, defaultIdx, in)
+	if err != nil {
+		return err
+	}
+	if err := setUILang(choice, true); err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println(uiTextf("Language set to: %s", choice))
+	fmt.Println(uiTextf("Current language: %s", currentUILang))
 	return nil
 }
 
@@ -2004,7 +2245,7 @@ func uiRunFlagWizard(c *client, in *bufio.Reader) error {
 		{Value: "apply", Title: "apply", Hint: "Apply config safely"},
 	}
 
-	choice, err := uiSelectOptionValue("Select command to build", options, 0, in)
+	choice, err := uiSelectOptionValue(uiText("Select command to build"), options, 0, in)
 	if err != nil {
 		return err
 	}
@@ -2017,8 +2258,8 @@ func uiRunFlagWizard(c *client, in *bufio.Reader) error {
 		return errUISelectionCanceled
 	}
 
-	fmt.Printf("\nCommand: psasctl %s\n", quoteCommandArgs(args))
-	runNow, err := promptYesNo(in, "Run this command?", true)
+	fmt.Printf("\n%s: psasctl %s\n", uiText("Command"), quoteCommandArgs(args))
+	runNow, err := promptYesNo(in, uiText("Run this command?"), true)
 	if err != nil {
 		return err
 	}
@@ -2632,7 +2873,11 @@ func promptYesNo(in *bufio.Reader, label string, def bool) (bool, error) {
 	if def {
 		defRaw = "y"
 	}
-	raw, err := promptLine(in, label+" (y/n)", defRaw)
+	suffix := " (y/n)"
+	if currentUILang == uiLangRU {
+		suffix = " (y/n, да/нет)"
+	}
+	raw, err := promptLine(in, label+suffix, defRaw)
 	if err != nil {
 		return false, err
 	}
@@ -2797,6 +3042,7 @@ func uiSelectOptionValue(title string, options []uiOption, defaultIdx int, in *b
 
 func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx int, in *bufio.Reader) (string, error) {
 	clearScreen()
+	title = uiText(title)
 
 	fmt.Println()
 	fmt.Println(title)
@@ -2804,13 +3050,13 @@ func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx in
 	fmt.Println()
 
 	for i, opt := range options {
-		fmt.Printf("  %d. %s\n", i+1, opt.Title)
+		fmt.Printf("  %d. %s\n", i+1, uiText(opt.Title))
 	}
-	fmt.Println("  q. Cancel")
+	fmt.Println(uiText("  q. Cancel"))
 
 	def := strconv.Itoa(defaultIdx + 1)
 	for {
-		raw, err := promptLine(in, "\nEnter option number", def)
+		raw, err := promptLine(in, uiText("\nEnter option number"), def)
 		if err != nil {
 			return "", err
 		}
@@ -2820,7 +3066,7 @@ func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx in
 		}
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 || n > len(options) {
-			printError(fmt.Sprintf("Invalid. Enter 1-%d or q", len(options)))
+			printError(uiTextf("Invalid. Enter 1-%d or q", len(options)))
 			continue
 		}
 		return options[n-1].Value, nil
@@ -2829,12 +3075,13 @@ func uiSelectOptionValueFallback(title string, options []uiOption, defaultIdx in
 
 func drawUIOptionsMenu(title string, options []uiOption, selected int) {
 	clearScreen()
+	title = uiText(title)
 
 	fmt.Println()
 	fmt.Println(title)
 	fmt.Println(strings.Repeat("=", len(title)))
 	fmt.Println()
-	fmt.Println("Controls: Up/Down or j/k, Enter to select, q to cancel")
+	fmt.Println(uiText("Controls: Up/Down or j/k, Enter to select, q to cancel"))
 	fmt.Println()
 
 	for i, opt := range options {
@@ -2842,12 +3089,12 @@ func drawUIOptionsMenu(title string, options []uiOption, selected int) {
 		if i == selected {
 			prefix = ">> "
 		}
-		fmt.Printf("%s%d. %s\n", prefix, i+1, opt.Title)
+		fmt.Printf("%s%d. %s\n", prefix, i+1, uiText(opt.Title))
 	}
 
 	if selected >= 0 && selected < len(options) && options[selected].Hint != "" {
 		fmt.Println()
-		fmt.Printf("  * %s\n", options[selected].Hint)
+		fmt.Printf("  * %s\n", uiText(options[selected].Hint))
 	}
 	fmt.Println()
 }
@@ -2967,6 +3214,7 @@ func uiSelectUser(users []apiUser, title string, in *bufio.Reader) (apiUser, err
 
 func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiUser, error) {
 	clearScreen()
+	title = uiText(title)
 
 	fmt.Println()
 	fmt.Println(title)
@@ -2984,11 +3232,11 @@ func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiU
 		}
 		fmt.Printf("  %d. %-20s %s [%s]\n", i+1, name, u.UUID, status)
 	}
-	fmt.Println("  0. Manual USER_ID input")
-	fmt.Println("  q. Cancel")
+	fmt.Println(uiText("  0. Manual USER_ID input"))
+	fmt.Println(uiText("  q. Cancel"))
 
 	for {
-		raw, err := promptRequiredLine(in, "\nEnter user number")
+		raw, err := promptRequiredLine(in, uiText("Enter user number"))
 		if err != nil {
 			return apiUser{}, err
 		}
@@ -2998,7 +3246,7 @@ func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiU
 		}
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 0 || n > len(users) {
-			printError(fmt.Sprintf("Invalid. Enter 0-%d or q", len(users)))
+			printError(uiTextf("Invalid. Enter 0-%d or q", len(users)))
 			continue
 		}
 		if n == 0 {
@@ -3010,20 +3258,21 @@ func uiSelectUserFallback(users []apiUser, title string, in *bufio.Reader) (apiU
 
 func drawUIUserPicker(title string, users, filtered []apiUser, selected int, query string) {
 	clearScreen()
+	title = uiText(title)
 
 	fmt.Println()
 	fmt.Println(title)
 	fmt.Println(strings.Repeat("=", len(title)))
 	fmt.Println()
-	fmt.Println("Controls: Up/Down to navigate, Enter to select, Type to filter")
-	fmt.Println("          Backspace to erase, i for manual input, q to cancel")
+	fmt.Println(uiText("Controls: Up/Down to navigate, Enter to select, Type to filter"))
+	fmt.Println(uiText("          Backspace to erase, i for manual input, q to cancel"))
 	fmt.Println()
-	fmt.Printf("Filter: %s\n", query)
-	fmt.Printf("Showing: %d / %d users\n", len(filtered), len(users))
+	fmt.Printf("%s\n", uiTextf("Filter: %s", query))
+	fmt.Printf("%s\n", uiTextf("Showing: %d / %d users", len(filtered), len(users)))
 	fmt.Println(strings.Repeat("-", 60))
 
 	if len(filtered) == 0 {
-		fmt.Println("  No users match current filter")
+		fmt.Println("  " + uiText("No users match current filter"))
 		return
 	}
 
@@ -3062,7 +3311,7 @@ func drawUIUserPicker(title string, users, filtered []apiUser, selected int, que
 	}
 
 	if end < len(filtered) {
-		fmt.Printf("\n  (Showing %d-%d of %d)\n", start+1, end, len(filtered))
+		fmt.Printf("\n  %s\n", uiTextf("(Showing %d-%d of %d)", start+1, end, len(filtered)))
 	}
 	fmt.Println()
 }
@@ -3243,6 +3492,7 @@ func uiSelectTrustUser(users []trustUser, title string, in *bufio.Reader) (trust
 
 func uiSelectTrustUserFallback(users []trustUser, title string, in *bufio.Reader) (trustUser, error) {
 	clearScreen()
+	title = uiText(title)
 
 	fmt.Println()
 	fmt.Println(title)
@@ -3252,11 +3502,11 @@ func uiSelectTrustUserFallback(users []trustUser, title string, in *bufio.Reader
 	for i, u := range users {
 		fmt.Printf("  %d. %-24s %s\n", i+1, u.Username, maskSecret(u.Password))
 	}
-	fmt.Println("  0. Manual USER_ID input")
-	fmt.Println("  q. Cancel")
+	fmt.Println(uiText("  0. Manual USER_ID input"))
+	fmt.Println(uiText("  q. Cancel"))
 
 	for {
-		raw, err := promptRequiredLine(in, "\nEnter user number")
+		raw, err := promptRequiredLine(in, uiText("Enter user number"))
 		if err != nil {
 			return trustUser{}, err
 		}
@@ -3266,7 +3516,7 @@ func uiSelectTrustUserFallback(users []trustUser, title string, in *bufio.Reader
 		}
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 0 || n > len(users) {
-			printError(fmt.Sprintf("Invalid. Enter 0-%d or q", len(users)))
+			printError(uiTextf("Invalid. Enter 0-%d or q", len(users)))
 			continue
 		}
 		if n == 0 {
@@ -3278,20 +3528,21 @@ func uiSelectTrustUserFallback(users []trustUser, title string, in *bufio.Reader
 
 func drawUITrustUserPicker(title string, users, filtered []trustUser, selected int, query string) {
 	clearScreen()
+	title = uiText(title)
 
 	fmt.Println()
 	fmt.Println(title)
 	fmt.Println(strings.Repeat("=", len(title)))
 	fmt.Println()
-	fmt.Println("Controls: Up/Down to navigate, Enter to select, Type to filter")
-	fmt.Println("          Backspace to erase, i for manual input, q to cancel")
+	fmt.Println(uiText("Controls: Up/Down to navigate, Enter to select, Type to filter"))
+	fmt.Println(uiText("          Backspace to erase, i for manual input, q to cancel"))
 	fmt.Println()
-	fmt.Printf("Filter: %s\n", query)
-	fmt.Printf("Showing: %d / %d users\n", len(filtered), len(users))
+	fmt.Printf("%s\n", uiTextf("Filter: %s", query))
+	fmt.Printf("%s\n", uiTextf("Showing: %d / %d users", len(filtered), len(users)))
 	fmt.Println(strings.Repeat("-", 60))
 
 	if len(filtered) == 0 {
-		fmt.Println("  No users match current filter")
+		fmt.Println("  " + uiText("No users match current filter"))
 		return
 	}
 
@@ -3323,7 +3574,7 @@ func drawUITrustUserPicker(title string, users, filtered []trustUser, selected i
 	}
 
 	if end < len(filtered) {
-		fmt.Printf("\n  (Showing %d-%d of %d)\n", start+1, end, len(filtered))
+		fmt.Printf("\n  %s\n", uiTextf("(Showing %d-%d of %d)", start+1, end, len(filtered)))
 	}
 	fmt.Println()
 }
@@ -3360,22 +3611,30 @@ func uiStatus(c *client) error {
 	mainDomain := c.mainDomain()
 
 	fmt.Println()
-	fmt.Println("System Status")
+	fmt.Println(uiText("System Status"))
 	fmt.Println("=============")
-	fmt.Printf("Main domain         : %s\n", mainDomain)
-	fmt.Printf("Admin URL           : %s\n", c.adminURL(mainDomain))
-	fmt.Printf("Client path         : %v\n", cfg["proxy_path_client"])
-	fmt.Printf("Reality enabled     : %v\n", cfg["reality_enable"])
-	fmt.Printf("Hysteria2 enabled   : %v\n", cfg["hysteria_enable"])
-	fmt.Printf("Hysteria base port  : %v\n", cfg["hysteria_port"])
-	fmt.Printf("Reality SNI         : %v\n", cfg["reality_server_names"])
-	fmt.Printf("Users               : %d\n", len(c.state.Users))
+	fmt.Printf("%-20s: %s\n", uiText("Main domain"), mainDomain)
+	fmt.Printf("%-20s: %s\n", uiText("Admin URL"), c.adminURL(mainDomain))
+	fmt.Printf("%-20s: %v\n", uiText("Client path"), cfg["proxy_path_client"])
+	fmt.Printf("%-20s: %v\n", uiText("Reality enabled"), cfg["reality_enable"])
+	fmt.Printf("%-20s: %v\n", uiText("Hysteria2 enabled"), cfg["hysteria_enable"])
+	fmt.Printf("%-20s: %v\n", uiText("Hysteria base port"), cfg["hysteria_port"])
+	fmt.Printf("%-20s: %v\n", uiText("Reality SNI"), cfg["reality_server_names"])
+	fmt.Printf("%-20s: %d\n", uiText("Users"), len(c.state.Users))
 	if tt, err := newTrustClient().status(); err == nil {
-		fmt.Printf("TrustTunnel installed: %t\n", tt.Installed)
+		fmt.Printf("%s: %t\n", uiText("TrustTunnel installed"), tt.Installed)
 		if tt.Installed {
-			fmt.Printf("TrustTunnel active   : %t\n", tt.ServiceActive)
-			fmt.Printf("TrustTunnel listen   : %s\n", tt.ListenAddress)
-			fmt.Printf("TrustTunnel users    : %d\n", tt.Users)
+			fmt.Printf("%s: %t\n", uiText("TrustTunnel active"), tt.ServiceActive)
+			fmt.Printf("%s: %s\n", uiText("TrustTunnel listen"), tt.ListenAddress)
+			fmt.Printf("%s: %d\n", uiText("TrustTunnel users"), tt.Users)
+		}
+	}
+	if sc, err := newSocksClient().status(); err == nil {
+		fmt.Printf("%s: %t\n", uiText("SOCKS installed"), sc.Installed)
+		if sc.Installed {
+			fmt.Printf("%s: %t\n", uiText("SOCKS active"), sc.ServiceActive)
+			fmt.Printf("%s: %s\n", uiText("SOCKS listen"), sc.ListenAddress)
+			fmt.Printf("%s: %d\n", uiText("SOCKS users"), sc.Users)
 		}
 	}
 	return nil
@@ -3411,7 +3670,7 @@ func uiFindUsers(c *client, in *bufio.Reader) error {
 	}
 	users = filterUsers(users, query, isYes(enabledRaw))
 	if len(users) == 0 {
-		fmt.Println("\nNo users found.")
+		fmt.Println("\n" + uiText("No users found."))
 		return nil
 	}
 	printUsers(users)
@@ -3545,7 +3804,7 @@ func uiAddUser(c *client, in *bufio.Reader) error {
 		return err
 	}
 	links := buildLinks(c.clientPath(), u.UUID, host)
-	fmt.Println("\nUser created successfully!")
+	fmt.Println("\n" + uiText("User created successfully!"))
 	printLinksFromSet(links)
 	return nil
 }
@@ -3865,7 +4124,7 @@ func uiDeleteUser(c *client, in *bufio.Reader) error {
 		return err
 	}
 	if !isYes(confirm) {
-		fmt.Println("Canceled.")
+		fmt.Println(uiText("Canceled."))
 		return nil
 	}
 	if err := c.userDelete(u.UUID); err != nil {
@@ -3914,16 +4173,16 @@ func uiSocksProxy(in *bufio.Reader) error {
 		case "service":
 			actionErr = uiSocksService(sc, in)
 		default:
-			actionErr = fmt.Errorf("unknown socks action: %s", action)
+			actionErr = fmt.Errorf(uiTextf("unknown socks action: %s", action))
 		}
 
 		if actionErr != nil {
 			if errors.Is(actionErr, errUISelectionCanceled) {
-				fmt.Println("\nCanceled.")
+				fmt.Println("\n" + uiText("Canceled."))
 			} else if errors.Is(actionErr, errUIExitRequested) || errors.Is(actionErr, io.EOF) {
 				return nil
 			} else {
-				fmt.Printf("\nERROR: %v\n", actionErr)
+				fmt.Printf("\n%s: %v\n", uiText("ERROR"), actionErr)
 			}
 		}
 
@@ -3941,9 +4200,7 @@ func uiSocksStatus(sc *socksClient) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println()
-	fmt.Println("SOCKS5 status")
-	fmt.Println("=============")
+	printSectionHeader("SOCKS5 status")
 	printSocksStatus(st)
 	return nil
 }
@@ -3953,9 +4210,7 @@ func uiSocksListUsers(sc *socksClient) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println()
-	fmt.Println("SOCKS users")
-	fmt.Println("===========")
+	printSectionHeader("SOCKS users")
 	printSocksUsers(users)
 	return nil
 }
@@ -3978,10 +4233,10 @@ func uiSocksAddUser(sc *socksClient, in *bufio.Reader) error {
 		return err
 	}
 	if hasSocksUserExact(users, login) {
-		return fmt.Errorf("socks user already exists: %s", login)
+		return fmt.Errorf(uiTextf("socks user already exists: %s", login))
 	}
 	if osSocksUserExists(login) {
-		return fmt.Errorf("linux user already exists: %s", login)
+		return fmt.Errorf(uiTextf("linux user already exists: %s", login))
 	}
 
 	password, err := promptLine(in, "Password (empty = auto-generate)", "")
@@ -4002,8 +4257,8 @@ func uiSocksAddUser(sc *socksClient, in *bufio.Reader) error {
 		return err
 	}
 
-	fmt.Printf("\nSOCKS user added: %s\n", login)
-	fmt.Printf("Password: %s\n", password)
+	fmt.Printf("\n%s\n", uiTextf("SOCKS user added: %s", login))
+	fmt.Printf("%s: %s\n", uiText("Password"), password)
 
 	showConfig, err := promptYesNo(in, "Print connection config now?", true)
 	if err != nil {
@@ -4028,7 +4283,7 @@ func uiSocksPrintConn(sc *socksClient, in *bufio.Reader, u socksUser) error {
 	if strings.TrimSpace(portRaw) != "" {
 		p, err := strconv.Atoi(strings.TrimSpace(portRaw))
 		if err != nil {
-			return fmt.Errorf("invalid port: %s", strings.TrimSpace(portRaw))
+			return fmt.Errorf(uiTextf("invalid port: %s", strings.TrimSpace(portRaw)))
 		}
 		port = p
 	}
@@ -4055,10 +4310,10 @@ func uiSocksEditUser(sc *socksClient, in *bufio.Reader) error {
 	}
 	idx := findSocksUserIndex(users, current.Name)
 	if idx < 0 {
-		return fmt.Errorf("selected user not found: %s", current.Name)
+		return fmt.Errorf(uiTextf("selected user not found: %s", current.Name))
 	}
 
-	newName, err := promptLine(in, fmt.Sprintf("New login (empty = keep: %s)", current.Name), "")
+	newName, err := promptLine(in, uiTextf("New login (empty = keep: %s)", current.Name), "")
 	if err != nil {
 		return err
 	}
@@ -4072,11 +4327,11 @@ func uiSocksEditUser(sc *socksClient, in *bufio.Reader) error {
 				continue
 			}
 			if strings.EqualFold(strings.TrimSpace(u.Name), newName) {
-				return fmt.Errorf("socks user already exists: %s", newName)
+				return fmt.Errorf(uiTextf("socks user already exists: %s", newName))
 			}
 		}
 		if osSocksUserExists(newName) {
-			return fmt.Errorf("linux user already exists: %s", newName)
+			return fmt.Errorf(uiTextf("linux user already exists: %s", newName))
 		}
 		if err := runCommand("usermod", "-l", newName, socksSystemUser(current)); err != nil {
 			return err
@@ -4098,15 +4353,15 @@ func uiSocksEditUser(sc *socksClient, in *bufio.Reader) error {
 	}
 
 	if users[idx] == current {
-		fmt.Println("\nNo changes requested.")
+		fmt.Println("\n" + uiText("No changes requested."))
 		return nil
 	}
 	if err := sc.writeUsers(users); err != nil {
 		return err
 	}
-	fmt.Printf("\nSOCKS user updated: %s -> %s\n", current.Name, users[idx].Name)
+	fmt.Printf("\n%s\n", uiTextf("SOCKS user updated: %s -> %s", current.Name, users[idx].Name))
 	if newPassword != "" {
-		fmt.Printf("New password: %s\n", newPassword)
+		fmt.Printf("%s\n", uiTextf("New password: %s", newPassword))
 	}
 	return nil
 }
@@ -4141,14 +4396,14 @@ func uiSocksDeleteUser(sc *socksClient, in *bufio.Reader) error {
 	}
 	idx := findSocksUserIndex(users, u.Name)
 	if idx < 0 {
-		return fmt.Errorf("selected user not found: %s", u.Name)
+		return fmt.Errorf(uiTextf("selected user not found: %s", u.Name))
 	}
-	confirm, err := promptLine(in, fmt.Sprintf("Delete SOCKS user %s? (yes/no)", u.Name), "no")
+	confirm, err := promptLine(in, uiTextf("Delete SOCKS user %s? (yes/no)", u.Name), "no")
 	if err != nil {
 		return err
 	}
 	if !isYes(confirm) {
-		fmt.Println("Canceled.")
+		fmt.Println(uiText("Canceled."))
 		return nil
 	}
 	next := make([]socksUser, 0, len(users)-1)
@@ -4157,9 +4412,9 @@ func uiSocksDeleteUser(sc *socksClient, in *bufio.Reader) error {
 	if err := sc.writeUsers(next); err != nil {
 		return err
 	}
-	fmt.Printf("Deleted SOCKS user: %s\n", u.Name)
+	fmt.Printf("%s\n", uiTextf("Deleted SOCKS user: %s", u.Name))
 	if err := sc.deleteLinuxUser(socksSystemUser(u)); err != nil {
-		fmt.Printf("Warning: %v\n", err)
+		fmt.Printf("%s\n", uiTextf("Warning: %s", err.Error()))
 	}
 	return nil
 }
@@ -4185,10 +4440,10 @@ func uiSocksService(sc *socksClient, in *bufio.Reader) error {
 		if err := runCommand("systemctl", action, sc.service); err != nil {
 			return err
 		}
-		fmt.Printf("SOCKS service %s: %s\n", action, sc.service)
+		fmt.Printf("%s\n", uiTextf("SOCKS service %s: %s", action, sc.service))
 		return nil
 	default:
-		return fmt.Errorf("unknown action: %s", action)
+		return fmt.Errorf(uiTextf("unknown action: %s", action))
 	}
 }
 
@@ -4234,16 +4489,16 @@ func uiTrustTunnel(in *bufio.Reader) error {
 		case "service":
 			actionErr = uiTrustService(tt, in)
 		default:
-			actionErr = fmt.Errorf("unknown trust action: %s", action)
+			actionErr = fmt.Errorf(uiTextf("unknown trust action: %s", action))
 		}
 
 		if actionErr != nil {
 			if errors.Is(actionErr, errUISelectionCanceled) {
-				fmt.Println("\nCanceled.")
+				fmt.Println("\n" + uiText("Canceled."))
 			} else if errors.Is(actionErr, errUIExitRequested) || errors.Is(actionErr, io.EOF) {
 				return nil
 			} else {
-				fmt.Printf("\nERROR: %v\n", actionErr)
+				fmt.Printf("\n%s: %v\n", uiText("ERROR"), actionErr)
 			}
 		}
 
@@ -4261,9 +4516,7 @@ func uiTrustStatus(tt *trustClient) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println()
-	fmt.Println("TrustTunnel status")
-	fmt.Println("==================")
+	printSectionHeader("TrustTunnel status")
 	printTrustStatus(st)
 	return nil
 }
@@ -4273,9 +4526,7 @@ func uiTrustListUsers(tt *trustClient) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println()
-	fmt.Println("TrustTunnel users")
-	fmt.Println("=================")
+	printSectionHeader("TrustTunnel users")
 	printTrustUsers(users)
 	return nil
 }
@@ -4295,7 +4546,7 @@ func uiTrustAddUser(tt *trustClient, in *bufio.Reader) error {
 		return err
 	}
 	if hasTrustUserExact(users, username) {
-		return fmt.Errorf("trust user already exists: %s", username)
+		return fmt.Errorf(uiTextf("trust user already exists: %s", username))
 	}
 
 	password, err := promptLine(in, "Password (empty = auto-generate)", "")
@@ -4312,10 +4563,10 @@ func uiTrustAddUser(tt *trustClient, in *bufio.Reader) error {
 		return err
 	}
 
-	fmt.Printf("\nTrustTunnel user added: %s\n", username)
-	fmt.Printf("Password: %s\n", password)
+	fmt.Printf("\n%s\n", uiTextf("TrustTunnel user added: %s", username))
+	fmt.Printf("%s: %s\n", uiText("Password"), password)
 	if warn := trustRestartWarning(tt.service, tt.restartService()); warn != "" {
-		fmt.Printf("Warning: %s\n", warn)
+		fmt.Printf("%s\n", uiTextf("Warning: %s", warn))
 	}
 
 	showConfig, err := promptYesNo(in, "Generate client config now?", false)
@@ -4335,7 +4586,7 @@ func uiTrustPrintClientConfig(tt *trustClient, in *bufio.Reader, username string
 	}
 	configText, err := tt.exportClientConfig(username, strings.TrimSpace(address))
 	if err != nil && strings.TrimSpace(address) == "" {
-		fmt.Printf("Auto address detection failed: %v\n", err)
+		fmt.Printf("%s\n", uiTextf("Auto address detection failed: %v", err))
 		manualAddress, perr := promptRequiredLine(in, "Address ip[:port] (manual)")
 		if perr != nil {
 			return perr
@@ -4346,7 +4597,7 @@ func uiTrustPrintClientConfig(tt *trustClient, in *bufio.Reader, username string
 		return err
 	}
 	fmt.Println()
-	fmt.Printf("Address: %s\n", tt.lastExportAddress)
+	fmt.Printf("%s\n", uiTextf("Address: %s", tt.lastExportAddress))
 	fmt.Println(configText)
 	return nil
 }
@@ -4362,10 +4613,10 @@ func uiTrustEditUser(tt *trustClient, in *bufio.Reader) error {
 	}
 	idx := findTrustUserIndex(users, current.Username)
 	if idx < 0 {
-		return fmt.Errorf("selected user not found: %s", current.Username)
+		return fmt.Errorf(uiTextf("selected user not found: %s", current.Username))
 	}
 
-	newName, err := promptLine(in, fmt.Sprintf("New username (empty = keep: %s)", current.Username), "")
+	newName, err := promptLine(in, uiTextf("New username (empty = keep: %s)", current.Username), "")
 	if err != nil {
 		return err
 	}
@@ -4379,7 +4630,7 @@ func uiTrustEditUser(tt *trustClient, in *bufio.Reader) error {
 				continue
 			}
 			if strings.EqualFold(strings.TrimSpace(u.Username), newName) {
-				return fmt.Errorf("trust user already exists: %s", newName)
+				return fmt.Errorf(uiTextf("trust user already exists: %s", newName))
 			}
 		}
 		users[idx].Username = newName
@@ -4395,16 +4646,16 @@ func uiTrustEditUser(tt *trustClient, in *bufio.Reader) error {
 	}
 
 	if users[idx] == current {
-		fmt.Println("\nNo changes requested.")
+		fmt.Println("\n" + uiText("No changes requested."))
 		return nil
 	}
 
 	if err := tt.writeUsers(users); err != nil {
 		return err
 	}
-	fmt.Printf("\nTrustTunnel user updated: %s\n", current.Username)
+	fmt.Printf("\n%s\n", uiTextf("TrustTunnel user updated: %s", current.Username))
 	if warn := trustRestartWarning(tt.service, tt.restartService()); warn != "" {
-		fmt.Printf("Warning: %s\n", warn)
+		fmt.Printf("%s\n", uiTextf("Warning: %s", warn))
 	}
 	printTrustUser(users[idx])
 	return nil
@@ -4438,14 +4689,14 @@ func uiTrustDeleteUser(tt *trustClient, in *bufio.Reader) error {
 	}
 	idx := findTrustUserIndex(users, u.Username)
 	if idx < 0 {
-		return fmt.Errorf("selected user not found: %s", u.Username)
+		return fmt.Errorf(uiTextf("selected user not found: %s", u.Username))
 	}
-	confirm, err := promptLine(in, fmt.Sprintf("Delete trust user %s? (yes/no)", u.Username), "no")
+	confirm, err := promptLine(in, uiTextf("Delete trust user %s? (yes/no)", u.Username), "no")
 	if err != nil {
 		return err
 	}
 	if !isYes(confirm) {
-		fmt.Println("Canceled.")
+		fmt.Println(uiText("Canceled."))
 		return nil
 	}
 	next := make([]trustUser, 0, len(users)-1)
@@ -4454,9 +4705,9 @@ func uiTrustDeleteUser(tt *trustClient, in *bufio.Reader) error {
 	if err := tt.writeUsers(next); err != nil {
 		return err
 	}
-	fmt.Printf("Deleted trust user: %s\n", u.Username)
+	fmt.Printf("%s\n", uiTextf("Deleted trust user: %s", u.Username))
 	if warn := trustRestartWarning(tt.service, tt.restartService()); warn != "" {
-		fmt.Printf("Warning: %s\n", warn)
+		fmt.Printf("%s\n", uiTextf("Warning: %s", warn))
 	}
 	return nil
 }
@@ -4482,10 +4733,10 @@ func uiTrustService(tt *trustClient, in *bufio.Reader) error {
 		if err := runCommand("systemctl", action, tt.service); err != nil {
 			return err
 		}
-		fmt.Printf("TrustTunnel service %s: %s\n", action, tt.service)
+		fmt.Printf("%s\n", uiTextf("TrustTunnel service %s: %s", action, tt.service))
 		return nil
 	default:
-		return fmt.Errorf("unknown action: %s", action)
+		return fmt.Errorf(uiTextf("unknown action: %s", action))
 	}
 }
 
@@ -5960,6 +6211,7 @@ func isInteractiveTerminal() bool {
 }
 
 func promptLine(in *bufio.Reader, label, def string) (string, error) {
+	label = uiText(label)
 	if def != "" {
 		fmt.Printf("%s [%s]: ", label, def)
 	} else {
@@ -5992,7 +6244,7 @@ func promptRequiredLine(in *bufio.Reader, label string) (string, error) {
 		if strings.TrimSpace(s) != "" {
 			return s, nil
 		}
-		printError("Value is required.")
+		printError(uiText("Value is required."))
 	}
 }
 
@@ -6005,7 +6257,7 @@ func promptPositiveIntValue(in *bufio.Reader, label string, def int) (int, error
 		}
 		v, err := parsePositiveInt(raw)
 		if err != nil {
-			printError(fmt.Sprintf("Invalid value: %v", err))
+			printError(uiTextf("Invalid value: %v", err))
 			continue
 		}
 		return v, nil
@@ -6021,7 +6273,7 @@ func promptPositiveFloatValue(in *bufio.Reader, label string, def float64) (floa
 		}
 		v, err := parsePositiveFloat(raw)
 		if err != nil {
-			printError(fmt.Sprintf("Invalid value: %v", err))
+			printError(uiTextf("Invalid value: %v", err))
 			continue
 		}
 		return v, nil
@@ -6085,9 +6337,9 @@ func resolveUserDisplayName(name, subscriptionName string, required bool) (strin
 
 func parseBoolLike(raw string) (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "1", "true", "t", "yes", "y", "on", "enable", "enabled":
+	case "1", "true", "t", "yes", "y", "on", "enable", "enabled", "да", "д":
 		return true, nil
-	case "0", "false", "f", "no", "n", "off", "disable", "disabled":
+	case "0", "false", "f", "no", "n", "off", "disable", "disabled", "нет", "н":
 		return false, nil
 	default:
 		return false, fmt.Errorf("invalid boolean value: %s", raw)
@@ -6135,7 +6387,7 @@ func anyToBool(v any) bool {
 
 func isYes(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "y", "yes", "1", "true":
+	case "y", "yes", "1", "true", "да", "д":
 		return true
 	default:
 		return false
@@ -6194,6 +6446,82 @@ func isIPv4(s string) bool {
 		}
 	}
 	return true
+}
+
+func normalizeUILang(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case uiLangUS:
+		return uiLangUS
+	case uiLangRU:
+		return uiLangRU
+	default:
+		return ""
+	}
+}
+
+func uiLangConfigPath() string {
+	if p := strings.TrimSpace(os.Getenv("PSAS_UI_LANG_FILE")); p != "" {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, ".config", "psasctl", "ui.json")
+	}
+	return "/tmp/psasctl-ui.json"
+}
+
+func initUILanguage() {
+	currentUILang = defaultUILang
+	if env := normalizeUILang(os.Getenv("PSAS_UI_LANG")); env != "" {
+		currentUILang = env
+		return
+	}
+	path := uiLangConfigPath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var cfg uiSettings
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return
+	}
+	if lang := normalizeUILang(cfg.Lang); lang != "" {
+		currentUILang = lang
+	}
+}
+
+func setUILang(lang string, persist bool) error {
+	lang = normalizeUILang(lang)
+	if lang == "" {
+		return errors.New("unsupported UI language (expected us|ru)")
+	}
+	currentUILang = lang
+	if !persist {
+		return nil
+	}
+	path := uiLangConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	payload, err := json.MarshalIndent(uiSettings{Lang: lang}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(payload, '\n'), 0o600)
+}
+
+func uiText(s string) string {
+	if currentUILang != uiLangRU {
+		return s
+	}
+	if v, ok := uiTextRU[s]; ok {
+		return v
+	}
+	return s
+}
+
+func uiTextf(format string, args ...any) string {
+	return fmt.Sprintf(uiText(format), args...)
 }
 
 func runCommand(bin string, args ...string) error {

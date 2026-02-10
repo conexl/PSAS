@@ -6,8 +6,9 @@ PSAS (Personal Secure Auto Setup) — набор инструментов для
 - `install/psas-install.sh` — интерактивный авто-установщик и hardening.
 - `hiddify-sub` (устанавливается скриптом) — простой CLI для пользователей/подписок.
 - `hiddify-apply-safe` (устанавливается скриптом) — безопасное применение конфигов с финальной синхронизацией LE-сертификата.
+- `socks5-sub` (устанавливается скриптом) — thin-wrapper для `psasctl socks`.
 - `trusttunnel-sub` (устанавливается скриптом) — thin-wrapper для `psasctl trust`.
-- `cmd/psasctl` — Go CLI для управления Hiddify и TrustTunnel.
+- `cmd/psasctl` — Go CLI для управления Hiddify, SOCKS5 (Dante) и TrustTunnel.
 
 ## 1) Быстрый старт
 
@@ -41,10 +42,12 @@ sudo ./psas-install.sh
 - Устанавливает вспомогательные команды:
   - `/usr/local/bin/hiddify-sub`
   - `/usr/local/bin/hiddify-apply-safe`
+  - `/usr/local/bin/socks5-sub`
   - `/usr/local/bin/trusttunnel-sub`
   - `/usr/local/sbin/sync-hiddify-cert.sh`
 - Настраивает cron на синхронизацию LE-сертификата в Hiddify:
   - `/etc/cron.d/sync-hiddify-cert`
+- Опционально устанавливает и настраивает Dante SOCKS5 (`danted`) с логином/паролем и хранением пользователей в `/etc/psas/socks-users.json`.
 - Опционально устанавливает и настраивает TrustTunnel (`/opt/trusttunnel`) на отдельном порту (по умолчанию `8443`) с отдельными пользователями.
 
 ## 3) Админ-панель

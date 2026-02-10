@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="0.2.0"
+SCRIPT_VERSION="0.3.0"
 
 info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*"; }
@@ -28,6 +28,10 @@ is_port() {
   local p="${1:-}"
   [[ "$p" =~ ^[0-9]{1,5}$ ]] || return 1
   ((p >= 1 && p <= 65535))
+}
+
+is_socks_login() {
+  [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]
 }
 
 install_prereqs() {
@@ -80,6 +84,129 @@ EOF
   chmod 0644 /etc/cron.d/reload-trusttunnel-cert
 }
 
+install_dante_if_needed() {
+  if [[ "${INSTALL_SOCKS5:-no}" != "yes" ]]; then
+    return
+  fi
+  if command -v danted >/dev/null 2>&1 || [[ -x /usr/sbin/danted ]]; then
+    info "Dante detected"
+    return
+  fi
+  info "Installing Dante SOCKS5 server..."
+  apt-get install -y dante-server
+}
+
+detect_default_iface() {
+  local iface
+  iface="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+  if [[ -z "$iface" ]]; then
+    iface="eth0"
+  fi
+  printf '%s' "$iface"
+}
+
+write_socks_sub_script() {
+  cat >/usr/local/bin/socks5-sub <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v psasctl >/dev/null 2>&1; then
+  exec psasctl socks "$@"
+fi
+
+cat >&2 <<'TXT'
+socks5-sub requires psasctl in PATH.
+Build and install psasctl from the PSAS repository, then retry:
+  cd /tmp/PSAS
+  go build -o psasctl ./cmd/psasctl
+  sudo install -m 0755 psasctl /usr/local/bin/psasctl
+TXT
+exit 1
+EOF
+  chmod 0755 /usr/local/bin/socks5-sub
+}
+
+configure_dante_socks() {
+  if [[ "${INSTALL_SOCKS5:-no}" != "yes" ]]; then
+    return
+  fi
+
+  if [[ -z "${SOCKS_PASS:-}" ]]; then
+    SOCKS_PASS="$(random_alnum 20)"
+  fi
+
+  local shell_bin
+  shell_bin="/usr/sbin/nologin"
+  if [[ ! -x "$shell_bin" ]]; then
+    shell_bin="/sbin/nologin"
+  fi
+  if [[ ! -x "$shell_bin" ]]; then
+    shell_bin="/bin/false"
+  fi
+
+  info "Configuring Dante SOCKS5 on port ${SOCKS_PORT}"
+  if id -u "${SOCKS_USER}" >/dev/null 2>&1; then
+    echo "${SOCKS_USER}:${SOCKS_PASS}" | chpasswd
+  else
+    useradd -M -N -s "$shell_bin" "${SOCKS_USER}"
+    echo "${SOCKS_USER}:${SOCKS_PASS}" | chpasswd
+  fi
+
+  SOCKS_IFACE="$(detect_default_iface)"
+  cat >/etc/danted.conf <<EOF
+logoutput: syslog
+
+internal: 0.0.0.0 port = ${SOCKS_PORT}
+external: ${SOCKS_IFACE}
+
+clientmethod: none
+socksmethod: username
+
+user.privileged: root
+user.notprivileged: nobody
+
+client pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+  log: error connect disconnect
+}
+
+socks pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+  command: connect udpassociate bind
+  log: error connect disconnect
+}
+EOF
+  chmod 0640 /etc/danted.conf
+
+  mkdir -p /etc/psas
+  jq -nc \
+    --arg name "${SOCKS_USER}" \
+    --arg password "${SOCKS_PASS}" \
+    '[{name:$name,password:$password,system_user:$name}]' >/etc/psas/socks-users.json
+  chmod 0600 /etc/psas/socks-users.json
+
+  systemctl daemon-reload
+  systemctl enable --now danted
+  systemctl restart danted
+
+  SOCKS_PUBLIC_IP="$(curl -4 -fsSL https://api.ipify.org 2>/dev/null || true)"
+  if [[ -z "$SOCKS_PUBLIC_IP" ]]; then
+    SOCKS_PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+
+  cat >/root/socks5-credentials.txt <<EOF
+Dante SOCKS5 credentials
+server=${SOCKS_SERVER_HOST}
+server_ip=${SOCKS_PUBLIC_IP}
+port=${SOCKS_PORT}
+username=${SOCKS_USER}
+password=${SOCKS_PASS}
+service=danted
+users_file=/etc/psas/socks-users.json
+EOF
+  chmod 0600 /root/socks5-credentials.txt
+}
+
 detect_panel_python() {
   if [[ -x /opt/hiddify-manager/.venv313/bin/python3 ]]; then
     PANEL_PY="/opt/hiddify-manager/.venv313/bin/python3"
@@ -90,6 +217,31 @@ detect_panel_python() {
   fi
 
   PANEL_CFG="/opt/hiddify-manager/hiddify-panel/app.cfg"
+}
+
+disable_hiddify_login_menu_autorun() {
+  local bashrc="/root/.bashrc"
+  [[ -f "$bashrc" ]] || return 0
+
+  # Remove legacy unconditional autostart lines if present.
+  sed -i \
+    -e '/^[[:space:]]*\/opt\/hiddify-manager\/menu\.sh[[:space:]]*$/d' \
+    -e '/^[[:space:]]*cd[[:space:]]\+\/opt\/hiddify-manager\/[[:space:]]*$/d' \
+    "$bashrc"
+
+  # Add opt-in block once.
+  if ! grep -q 'HIDDIFY_MENU_ON_LOGIN' "$bashrc"; then
+    cat >>"$bashrc" <<'EOF'
+
+# Hiddify interactive menu on login is disabled by PSAS installer.
+# To re-enable for current session:
+#   export HIDDIFY_MENU_ON_LOGIN=1
+if [[ "${HIDDIFY_MENU_ON_LOGIN:-0}" == "1" ]]; then
+  /opt/hiddify-manager/menu.sh
+  cd /opt/hiddify-manager/ || true
+fi
+EOF
+  fi
 }
 
 hp_cli() {
@@ -1114,6 +1266,7 @@ EOF
 configure_ufw() {
   local hy2_port="$1"
   local trust_port="${2:-}"
+  local socks_port="${3:-}"
   ufw allow 22/tcp || true
   ufw allow 80/tcp || true
   ufw allow 443/tcp || true
@@ -1124,6 +1277,9 @@ configure_ufw() {
   if [[ -n "$trust_port" ]]; then
     ufw allow "${trust_port}/tcp" || true
     ufw allow "${trust_port}/udp" || true
+  fi
+  if [[ -n "$socks_port" ]]; then
+    ufw allow "${socks_port}/tcp" || true
   fi
 
   yes | ufw delete allow 1945 2>/dev/null || true
@@ -1172,6 +1328,14 @@ print_summary() {
   echo "Admin password: ${ADMIN_PASS}"
   echo "Client path: ${CLIENT_PATH}"
   echo "Hysteria2 UDP port: ${HY2_PORT}"
+  echo "Hiddify SSH login menu autostart: disabled (set HIDDIFY_MENU_ON_LOGIN=1 to enable per session)"
+  if [[ "${INSTALL_SOCKS5:-no}" == "yes" ]]; then
+    echo "SOCKS5 server: ${SOCKS_SERVER_HOST}"
+    echo "SOCKS5 port: ${SOCKS_PORT}"
+    echo "SOCKS5 username: ${SOCKS_USER}"
+    echo "SOCKS5 password: ${SOCKS_PASS}"
+    echo "SOCKS5 creds file: /root/socks5-credentials.txt"
+  fi
   if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" ]]; then
     echo "TrustTunnel domain: ${TRUSTTUNNEL_DOMAIN}"
     echo "TrustTunnel port: ${TRUSTTUNNEL_PORT}"
@@ -1190,6 +1354,16 @@ print_summary() {
   echo "  hiddify-sub add --name user01 --true-unlimited --mode no_reset"
   echo "  hiddify-sub protocols enable hysteria2"
   echo "  hiddify-sub show <USER_ID>"
+  if [[ "${INSTALL_SOCKS5:-no}" == "yes" ]]; then
+    echo
+    echo "SOCKS5 management commands:"
+    echo "  psasctl socks status"
+    echo "  psasctl socks users list"
+    echo "  psasctl socks users add --name user01 --show-config --server ${SOCKS_SERVER_HOST}"
+    echo "  psasctl socks users show --show-config --server ${SOCKS_SERVER_HOST} user01"
+    echo "  psasctl socks users del user01"
+    echo "  psasctl socks service restart"
+  fi
   if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" ]]; then
     echo
     echo "TrustTunnel management commands:"
@@ -1268,6 +1442,53 @@ prompt_inputs() {
     exit 1
   fi
 
+  read -r -p "Install Dante SOCKS5 proxy too? [yes/no, default yes]: " INSTALL_SOCKS5
+  INSTALL_SOCKS5="${INSTALL_SOCKS5:-yes}"
+  if [[ "$INSTALL_SOCKS5" != "yes" && "$INSTALL_SOCKS5" != "no" ]]; then
+    err "INSTALL_SOCKS5 must be yes or no"
+    exit 1
+  fi
+
+  if [[ "$INSTALL_SOCKS5" == "yes" ]]; then
+    read -r -p "SOCKS server host/domain for clients [${MAIN_DOMAIN}]: " SOCKS_SERVER_HOST
+    SOCKS_SERVER_HOST="${SOCKS_SERVER_HOST:-$MAIN_DOMAIN}"
+    if [[ -z "$SOCKS_SERVER_HOST" || "$SOCKS_SERVER_HOST" =~ [[:space:]] ]]; then
+      err "Invalid SOCKS server host"
+      exit 1
+    fi
+
+    read -r -p "SOCKS listen port [1080]: " SOCKS_PORT
+    SOCKS_PORT="${SOCKS_PORT:-1080}"
+    if ! is_port "$SOCKS_PORT"; then
+      err "Invalid SOCKS port"
+      exit 1
+    fi
+    if [[ "$SOCKS_PORT" == "80" || "$SOCKS_PORT" == "443" ]]; then
+      err "SOCKS port ${SOCKS_PORT} conflicts with Hiddify web ports 80/443"
+      exit 1
+    fi
+    if [[ "$SOCKS_PORT" == "$HYSTERIA_BASE_PORT" || "$SOCKS_PORT" == "$SPECIAL_BASE_PORT" ]]; then
+      err "SOCKS port ${SOCKS_PORT} conflicts with Hiddify configured ports"
+      exit 1
+    fi
+
+    read -r -p "Initial SOCKS username [socks01]: " SOCKS_USER
+    SOCKS_USER="${SOCKS_USER:-socks01}"
+    if ! is_socks_login "$SOCKS_USER"; then
+      err "SOCKS username must match [a-z_][a-z0-9_-]{0,30}"
+      exit 1
+    fi
+
+    read -r -s -p "Initial SOCKS password [auto-generated if empty]: " SOCKS_PASS
+    echo
+    if [[ -n "$SOCKS_PASS" ]]; then
+      if [[ "$SOCKS_PASS" == *:* || "$SOCKS_PASS" == *$'\n'* || "$SOCKS_PASS" == *$'\r'* ]]; then
+        err "SOCKS password must not contain ':' or line breaks"
+        exit 1
+      fi
+    fi
+  fi
+
   read -r -p "Install TrustTunnel endpoint too? [yes/no, default yes]: " INSTALL_TRUSTTUNNEL
   INSTALL_TRUSTTUNNEL="${INSTALL_TRUSTTUNNEL:-yes}"
   if [[ "$INSTALL_TRUSTTUNNEL" != "yes" && "$INSTALL_TRUSTTUNNEL" != "no" ]]; then
@@ -1297,6 +1518,10 @@ prompt_inputs() {
       err "TrustTunnel port ${TRUSTTUNNEL_PORT} conflicts with Hiddify configured ports"
       exit 1
     fi
+    if [[ "${INSTALL_SOCKS5:-no}" == "yes" && "$TRUSTTUNNEL_PORT" == "$SOCKS_PORT" ]]; then
+      err "TrustTunnel port ${TRUSTTUNNEL_PORT} conflicts with SOCKS port ${SOCKS_PORT}"
+      exit 1
+    fi
 
     read -r -p "TrustTunnel initial username [ttadmin]: " TRUSTTUNNEL_USER
     TRUSTTUNNEL_USER="${TRUSTTUNNEL_USER:-ttadmin}"
@@ -1317,8 +1542,10 @@ main() {
   install_prereqs
   install_hiddify_if_needed
   wait_hiddify
+  disable_hiddify_login_menu_autorun
   detect_panel_python
   backup_hiddify
+  install_dante_if_needed
   install_trusttunnel_if_needed
 
   if [[ "$DO_CLEANUP" == "yes" ]]; then
@@ -1328,6 +1555,9 @@ main() {
   write_sync_cert_script
   write_apply_safe_script
   write_hiddify_sub_script
+  if [[ "${INSTALL_SOCKS5:-no}" == "yes" ]]; then
+    write_socks_sub_script
+  fi
   if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" ]]; then
     write_trusttunnel_sub_script
   fi
@@ -1342,9 +1572,10 @@ main() {
   /usr/local/sbin/sync-hiddify-cert.sh "$MAIN_DOMAIN" || true
 
   collect_state
+  configure_dante_socks
   configure_trusttunnel_endpoint
 
-  configure_ufw "$HY2_PORT" "${TRUSTTUNNEL_PORT:-}"
+  configure_ufw "$HY2_PORT" "${TRUSTTUNNEL_PORT:-}" "${SOCKS_PORT:-}"
   configure_fail2ban
   configure_sysctl
 
