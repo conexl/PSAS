@@ -181,28 +181,35 @@ var uiTextRU = map[string]string{
 	"Supported: us, ru":          "Поддерживается: us, ru",
 	"PSASCTL - Interactive Menu": "PSASCTL - Интерактивное меню",
 	"Controls: Up/Down or j/k to navigate, Enter to select, q to quit": "Управление: Up/Down или j/k, Enter выбрать, q выйти",
-	"Quick select: Press number 1-9 or shortcut key":                   "Быстрый выбор: нажмите 1-9 или горячую клавишу",
+	"Quick select: Type number and press Enter, or use shortcut key":   "Быстрый выбор: введите номер и нажмите Enter, или используйте горячую клавишу",
 	"Controls: Up/Down or j/k, Enter to select, q to cancel":           "Управление: Up/Down или j/k, Enter выбрать, q отмена",
-	"Press Enter to return to menu (q to exit)...":                     "Нажмите Enter для возврата в меню (q для выхода)...",
-	"Select command to build":                                          "Выберите команду для сборки",
-	"Run this command?":                                                "Запустить эту команду?",
-	"Canceled.":                                                        "Отменено.",
-	"ERROR":                                                            "ОШИБКА",
-	"Exit":                                                             "Выход",
-	"Back":                                                             "Назад",
-	"Status":                                                           "Статус",
-	"List users":                                                       "Список пользователей",
-	"Find users":                                                       "Поиск пользователей",
-	"Show user + links":                                                "Пользователь + ссылки",
-	"Add user":                                                         "Добавить пользователя",
-	"Edit user":                                                        "Изменить пользователя",
-	"Delete user":                                                      "Удалить пользователя",
-	"Protocols":                                                        "Протоколы",
-	"Admin URL":                                                        "Ссылка админки",
-	"Apply config":                                                     "Применить конфиг",
-	"Flag command wizard":                                              "Мастер флаговых команд",
-	"SOCKS5 (Dante)":                                                   "SOCKS5 (Dante)",
-	"TrustTunnel":                                                      "TrustTunnel",
+	"Selected number": "Выбранный номер",
+	"Sections: Hiddify Manager / Proxy Services / Tools / Preferences": "Разделы: Hiddify Manager / Proxy сервисы / Инструменты / Настройки",
+	"Hiddify Manager": "Hiddify Manager",
+	"Proxy Services":  "Proxy сервисы",
+	"Tools":           "Инструменты",
+	"Preferences":     "Настройки",
+	"Session":         "Сессия",
+	"Press Enter to return to menu (q to exit)...": "Нажмите Enter для возврата в меню (q для выхода)...",
+	"Select command to build":                      "Выберите команду для сборки",
+	"Run this command?":                            "Запустить эту команду?",
+	"Canceled.":                                    "Отменено.",
+	"ERROR":                                        "ОШИБКА",
+	"Exit":                                         "Выход",
+	"Back":                                         "Назад",
+	"Status":                                       "Статус",
+	"List users":                                   "Список пользователей",
+	"Find users":                                   "Поиск пользователей",
+	"Show user + links":                            "Пользователь + ссылки",
+	"Add user":                                     "Добавить пользователя",
+	"Edit user":                                    "Изменить пользователя",
+	"Delete user":                                  "Удалить пользователя",
+	"Protocols":                                    "Протоколы",
+	"Admin URL":                                    "Ссылка админки",
+	"Apply config":                                 "Применить конфиг",
+	"Flag command wizard":                          "Мастер флаговых команд",
+	"SOCKS5 (Dante)":                               "SOCKS5 (Dante)",
+	"TrustTunnel":                                  "TrustTunnel",
 	"Main domain, admin URL, protocols, users count":                    "Основной домен, админ URL, протоколы, количество пользователей",
 	"Print all users in a table":                                        "Показать всех пользователей в таблице",
 	"Search users by name/part and optional enabled filter":             "Поиск пользователей по имени/части и фильтру enabled",
@@ -305,7 +312,7 @@ var uiTextRU = map[string]string{
 	"Select SOCKS user":                                 "Выберите SOCKS пользователя",
 	"Print connection config?":                          "Показать конфиг подключения?",
 	"Select SOCKS user to delete":                       "Выберите SOCKS пользователя для удаления",
-	"Delete SOCKS user %s? (yes/no)":                    "Удалить SOCKS пользователя %s? (yes/no)",
+	"Delete SOCKS user %s?":                             "Удалить SOCKS пользователя %s?",
 	"Deleted SOCKS user: %s":                            "SOCKS пользователь удален: %s",
 	"Show systemctl status":                             "Показать статус systemctl",
 	"Start service":                                     "Запустить сервис",
@@ -334,7 +341,8 @@ var uiTextRU = map[string]string{
 	"Select TrustTunnel user":                           "Выберите пользователя TrustTunnel",
 	"Generate client config?":                           "Сгенерировать клиентский конфиг?",
 	"Select TrustTunnel user to delete":                 "Выберите пользователя TrustTunnel для удаления",
-	"Delete trust user %s? (yes/no)":                    "Удалить trust пользователя %s? (yes/no)",
+	"Delete trust user %s?":                             "Удалить пользователя TrustTunnel %s?",
+	"Confirm delete?":                                   "Подтвердить удаление?",
 	"Deleted trust user: %s":                            "Trust пользователь удален: %s",
 	"TrustTunnel service":                               "Сервис TrustTunnel",
 	"Return to TrustTunnel menu":                        "Вернуться в меню TrustTunnel",
@@ -1770,21 +1778,21 @@ func runUI(args []string) {
 	c := mustClient(true)
 	in := bufio.NewReader(os.Stdin)
 	menuItems := []uiMenuItem{
-		{Key: "status", Shortcut: 's', Title: "Status", Hint: "Main domain, admin URL, protocols, users count"},
-		{Key: "list", Shortcut: 'l', Title: "List users", Hint: "Print all users in a table"},
-		{Key: "find", Shortcut: 'f', Title: "Find users", Hint: "Search users by name/part and optional enabled filter"},
-		{Key: "show", Shortcut: 'v', Title: "Show user + links", Hint: "Pick a user with arrows and print links"},
-		{Key: "add", Shortcut: 'a', Title: "Add user", Hint: "Step-by-step wizard for creating a user"},
-		{Key: "edit", Shortcut: 'e', Title: "Edit user", Hint: "Pick a user and edit name/limits/mode/enabled state"},
-		{Key: "delete", Shortcut: 'd', Title: "Delete user", Hint: "Pick a user and delete with confirmation"},
-		{Key: "socks", Shortcut: 'k', Title: "SOCKS5 (Dante)", Hint: "Manage SOCKS users and danted service"},
-		{Key: "trust", Shortcut: 'r', Title: "TrustTunnel", Hint: "Manage TrustTunnel users and service"},
-		{Key: "protocols", Shortcut: 't', Title: "Protocols", Hint: "List and toggle protocol enable flags"},
-		{Key: "admin", Shortcut: 'u', Title: "Admin URL", Hint: "Print panel admin URL"},
-		{Key: "apply", Shortcut: 'p', Title: "Apply config", Hint: "Run hiddify-apply-safe or panel apply"},
-		{Key: "wizard", Shortcut: 'w', Title: "Flag command wizard", Hint: "Build and run existing psasctl commands with their original flags"},
-		{Key: "lang", Shortcut: 'g', Title: "Language", Hint: "Language and UI preferences"},
-		{Key: "exit", Shortcut: 'q', Title: "Exit", Hint: "Leave interactive mode"},
+		{Section: "Hiddify Manager", Key: "status", Shortcut: 's', Title: "Status", Hint: "Main domain, admin URL, protocols, users count"},
+		{Section: "Hiddify Manager", Key: "list", Shortcut: 'l', Title: "List users", Hint: "Print all users in a table"},
+		{Section: "Hiddify Manager", Key: "find", Shortcut: 'f', Title: "Find users", Hint: "Search users by name/part and optional enabled filter"},
+		{Section: "Hiddify Manager", Key: "show", Shortcut: 'v', Title: "Show user + links", Hint: "Pick a user with arrows and print links"},
+		{Section: "Hiddify Manager", Key: "add", Shortcut: 'a', Title: "Add user", Hint: "Step-by-step wizard for creating a user"},
+		{Section: "Hiddify Manager", Key: "edit", Shortcut: 'e', Title: "Edit user", Hint: "Pick a user and edit name/limits/mode/enabled state"},
+		{Section: "Hiddify Manager", Key: "delete", Shortcut: 'd', Title: "Delete user", Hint: "Pick a user and delete with confirmation"},
+		{Section: "Hiddify Manager", Key: "protocols", Shortcut: 't', Title: "Protocols", Hint: "List and toggle protocol enable flags"},
+		{Section: "Hiddify Manager", Key: "admin", Shortcut: 'u', Title: "Admin URL", Hint: "Print panel admin URL"},
+		{Section: "Hiddify Manager", Key: "apply", Shortcut: 'p', Title: "Apply config", Hint: "Run hiddify-apply-safe or panel apply"},
+		{Section: "Proxy Services", Key: "socks", Shortcut: 'k', Title: "SOCKS5 (Dante)", Hint: "Manage SOCKS users and danted service"},
+		{Section: "Proxy Services", Key: "trust", Shortcut: 'r', Title: "TrustTunnel", Hint: "Manage TrustTunnel users and service"},
+		{Section: "Tools", Key: "wizard", Shortcut: 'w', Title: "Flag command wizard", Hint: "Build and run existing psasctl commands with their original flags"},
+		{Section: "Preferences", Key: "lang", Shortcut: 'g', Title: "Language", Hint: "Language and UI preferences"},
+		{Section: "Session", Key: "exit", Shortcut: 'q', Title: "Exit", Hint: "Leave interactive mode"},
 	}
 
 	for {
@@ -1874,6 +1882,7 @@ func runUI(args []string) {
 }
 
 type uiMenuItem struct {
+	Section  string
 	Key      string
 	Shortcut rune
 	Title    string
@@ -1946,34 +1955,64 @@ func uiSelectMenuItem(items []uiMenuItem, in *bufio.Reader) (uiMenuItem, error) 
 	defer state.restore()
 
 	selected := 0
+	typedNumber := ""
 	rawIn := bufio.NewReader(os.Stdin)
 	for {
-		drawUIMenu(items, selected)
+		drawUIMenu(items, selected, typedNumber)
 		input, err := readUIMenuKey(rawIn)
 		if err != nil {
 			return uiMenuItem{}, err
 		}
 		switch input.Key {
 		case uiMenuKeyUp:
+			typedNumber = ""
 			selected--
 			if selected < 0 {
 				selected = len(items) - 1
 			}
 		case uiMenuKeyDown:
+			typedNumber = ""
 			selected++
 			if selected >= len(items) {
 				selected = 0
 			}
 		case uiMenuKeyHome:
+			typedNumber = ""
 			selected = 0
 		case uiMenuKeyEnd:
+			typedNumber = ""
 			selected = len(items) - 1
+		case uiMenuKeyBackspace:
+			if len(typedNumber) > 0 {
+				typedNumber = typedNumber[:len(typedNumber)-1]
+			}
 		case uiMenuKeyEnter:
+			if typedNumber != "" {
+				n, err := strconv.Atoi(typedNumber)
+				if err == nil && n >= 1 && n <= len(items) {
+					return items[n-1], nil
+				}
+				typedNumber = ""
+				continue
+			}
 			return items[selected], nil
 		case uiMenuKeyQuit:
 			return uiMenuItem{Key: "exit", Title: "Exit"}, nil
 		case uiMenuKeyChar:
 			ch := unicode.ToLower(input.Ch)
+			if ch >= '0' && ch <= '9' {
+				maxDigits := len(strconv.Itoa(len(items)))
+				if len(typedNumber) >= maxDigits {
+					typedNumber = ""
+				}
+				typedNumber += string(ch)
+				n, err := strconv.Atoi(typedNumber)
+				if err == nil && n >= 1 && n <= len(items) {
+					selected = n - 1
+				}
+				continue
+			}
+			typedNumber = ""
 			switch ch {
 			case 'k':
 				selected--
@@ -1987,17 +2026,8 @@ func uiSelectMenuItem(items []uiMenuItem, in *bufio.Reader) (uiMenuItem, error) 
 					selected = 0
 				}
 				continue
-			case 'g':
-				selected = 0
-				continue
 			case 'q':
 				return uiMenuItem{Key: "exit", Title: "Exit"}, nil
-			}
-			if ch >= '1' && ch <= '9' {
-				idx := int(ch - '1')
-				if idx >= 0 && idx < len(items) {
-					return items[idx], nil
-				}
 			}
 			if idx, ok := findMenuItemByShortcut(items, ch); ok {
 				return items[idx], nil
@@ -2014,7 +2044,16 @@ func uiSelectMenuItemFallback(items []uiMenuItem, in *bufio.Reader) (uiMenuItem,
 	fmt.Println("===========================")
 	fmt.Println()
 
+	lastSection := ""
 	for i, item := range items {
+		section := strings.TrimSpace(item.Section)
+		if section != "" && section != lastSection {
+			if i > 0 {
+				fmt.Println()
+			}
+			fmt.Printf("  [%s]\n", uiText(section))
+			lastSection = section
+		}
 		fmt.Printf("  %d. %s\n", i+1, uiText(item.Title))
 	}
 	fmt.Println(uiText("  q. Exit"))
@@ -2037,7 +2076,7 @@ func uiSelectMenuItemFallback(items []uiMenuItem, in *bufio.Reader) (uiMenuItem,
 	}
 }
 
-func drawUIMenu(items []uiMenuItem, selected int) {
+func drawUIMenu(items []uiMenuItem, selected int, typedNumber string) {
 	clearScreen()
 
 	fmt.Println()
@@ -2045,12 +2084,25 @@ func drawUIMenu(items []uiMenuItem, selected int) {
 	fmt.Println("===========================")
 	fmt.Println()
 	fmt.Println(uiText("Controls: Up/Down or j/k to navigate, Enter to select, q to quit"))
-	fmt.Println(uiText("Quick select: Press number 1-9 or shortcut key"))
+	fmt.Println(uiText("Quick select: Type number and press Enter, or use shortcut key"))
 	fmt.Printf("%s: %s\n", uiText("Language"), currentUILang)
-	fmt.Println(uiText("Status / users / links / settings"))
+	if strings.TrimSpace(typedNumber) != "" {
+		fmt.Printf("%s: %s\n", uiText("Selected number"), typedNumber)
+	}
+	fmt.Println(uiText("Sections: Hiddify Manager / Proxy Services / Tools / Preferences"))
 	fmt.Println()
 
+	lastSection := ""
 	for i, item := range items {
+		section := strings.TrimSpace(item.Section)
+		if section != "" && section != lastSection {
+			if i > 0 {
+				fmt.Println()
+			}
+			fmt.Printf("  [%s]\n", uiText(section))
+			lastSection = section
+		}
+
 		prefix := "   "
 		if i == selected {
 			prefix = ">> "
@@ -2869,13 +2921,17 @@ func uiBuildWizardArgs(c *client, choice string, in *bufio.Reader) ([]string, er
 }
 
 func promptYesNo(in *bufio.Reader, label string, def bool) (bool, error) {
-	defRaw := "n"
+	defRaw := "no"
 	if def {
-		defRaw = "y"
+		defRaw = "yes"
 	}
-	suffix := " (y/n)"
+	suffix := " (yes/no)"
 	if currentUILang == uiLangRU {
-		suffix = " (y/n, да/нет)"
+		suffix = " (yes/no, да/нет)"
+		defRaw = "нет"
+		if def {
+			defRaw = "да"
+		}
 	}
 	raw, err := promptLine(in, label+suffix, defRaw)
 	if err != nil {
@@ -4119,11 +4175,11 @@ func uiDeleteUser(c *client, in *bufio.Reader) error {
 	}
 
 	fmt.Printf("\nAbout to delete: %s (%s)\n", u.UUID, u.Name)
-	confirm, err := promptLine(in, "Confirm delete? (yes/no)", "no")
+	confirm, err := promptYesNo(in, "Confirm delete?", false)
 	if err != nil {
 		return err
 	}
-	if !isYes(confirm) {
+	if !confirm {
 		fmt.Println(uiText("Canceled."))
 		return nil
 	}
@@ -4398,11 +4454,11 @@ func uiSocksDeleteUser(sc *socksClient, in *bufio.Reader) error {
 	if idx < 0 {
 		return fmt.Errorf(uiTextf("selected user not found: %s", u.Name))
 	}
-	confirm, err := promptLine(in, uiTextf("Delete SOCKS user %s? (yes/no)", u.Name), "no")
+	confirm, err := promptYesNo(in, uiTextf("Delete SOCKS user %s?", u.Name), false)
 	if err != nil {
 		return err
 	}
-	if !isYes(confirm) {
+	if !confirm {
 		fmt.Println(uiText("Canceled."))
 		return nil
 	}
@@ -4691,11 +4747,11 @@ func uiTrustDeleteUser(tt *trustClient, in *bufio.Reader) error {
 	if idx < 0 {
 		return fmt.Errorf(uiTextf("selected user not found: %s", u.Username))
 	}
-	confirm, err := promptLine(in, uiTextf("Delete trust user %s? (yes/no)", u.Username), "no")
+	confirm, err := promptYesNo(in, uiTextf("Delete trust user %s?", u.Username), false)
 	if err != nil {
 		return err
 	}
-	if !isYes(confirm) {
+	if !confirm {
 		fmt.Println(uiText("Canceled."))
 		return nil
 	}
