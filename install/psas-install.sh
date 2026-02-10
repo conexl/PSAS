@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION="0.4.0"
 
 info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*"; }
@@ -32,6 +32,10 @@ is_port() {
 
 is_socks_login() {
   [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]
+}
+
+is_hex_secret_32() {
+  [[ "${1:-}" =~ ^[A-Fa-f0-9]{32}$ ]]
 }
 
 install_prereqs() {
@@ -82,6 +86,47 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 41 3 * * * root systemctl restart trusttunnel.service >/dev/null 2>&1 || true
 EOF
   chmod 0644 /etc/cron.d/reload-trusttunnel-cert
+}
+
+install_mtproxy_if_needed() {
+  if [[ "${INSTALL_MTPROXY:-no}" != "yes" ]]; then
+    return
+  fi
+
+  if [[ -x /opt/MTProxy/objs/bin/mtproto-proxy ]]; then
+    info "Telegram MTProxy detected in /opt/MTProxy"
+  else
+    info "Installing Telegram MTProxy..."
+    apt-get install -y git build-essential libssl-dev zlib1g-dev
+    if [[ -d /opt/MTProxy/.git ]]; then
+      git -C /opt/MTProxy pull --ff-only || true
+    else
+      rm -rf /opt/MTProxy
+      git clone --depth 1 https://github.com/TelegramMessenger/MTProxy.git /opt/MTProxy
+    fi
+
+    # Upstream MTProxy asserts when PID > 65535 (common on modern systems).
+    # Patch to store low 16 bits instead of aborting.
+    if [[ -f /opt/MTProxy/common/pid.c ]]; then
+      if grep -q 'assert (!(p & 0xffff0000));' /opt/MTProxy/common/pid.c; then
+        cp -a /opt/MTProxy/common/pid.c /opt/MTProxy/common/pid.c.psas.bak
+        perl -0777 -i -pe 's/int p = getpid \\(\\);\\s*assert \\(!\\(p & 0xffff0000\\)\\);\\s*PID\\.pid = p;/int p = getpid ();\\n    if (p < 0) { p = 0; }\\n    PID.pid = (unsigned short) p;/s' /opt/MTProxy/common/pid.c
+      fi
+    fi
+
+    (
+      cd /opt/MTProxy
+      make -j"$(nproc 2>/dev/null || echo 2)"
+    )
+  fi
+
+  if [[ ! -s /opt/MTProxy/proxy-secret ]]; then
+    curl -fsSL https://core.telegram.org/getProxySecret -o /opt/MTProxy/proxy-secret
+  fi
+  if [[ ! -s /opt/MTProxy/proxy-multi.conf ]]; then
+    curl -fsSL https://core.telegram.org/getProxyConfig -o /opt/MTProxy/proxy-multi.conf
+  fi
+  chmod 0644 /opt/MTProxy/proxy-secret /opt/MTProxy/proxy-multi.conf
 }
 
 install_dante_if_needed() {
@@ -1044,6 +1089,116 @@ EOF
   chmod 0755 /usr/local/bin/trusttunnel-sub
 }
 
+write_mtproxy_sub_script() {
+  cat >/usr/local/bin/mtproxy-sub <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v psasctl >/dev/null 2>&1; then
+  exec psasctl mtproxy "$@"
+fi
+
+cat >&2 <<'TXT'
+mtproxy-sub requires psasctl in PATH.
+Build and install psasctl from the PSAS repository, then retry:
+  cd /tmp/PSAS
+  go build -o psasctl ./cmd/psasctl
+  sudo install -m 0755 psasctl /usr/local/bin/psasctl
+TXT
+exit 1
+EOF
+  chmod 0755 /usr/local/bin/mtproxy-sub
+}
+
+write_mtproxy_runner_script() {
+  cat >/usr/local/bin/psas-mtproxy-run <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONF_PATH="${PSAS_MTPROXY_CONF:-/etc/psas/mtproxy.json}"
+MTPROXY_DIR="${PSAS_MTPROXY_DIR:-/opt/MTProxy}"
+BIN_PATH="${PSAS_MTPROXY_BIN:-${MTPROXY_DIR}/objs/bin/mtproto-proxy}"
+
+[[ -x "$BIN_PATH" ]] || { echo "mtproto-proxy binary not found: $BIN_PATH" >&2; exit 1; }
+[[ -s "$CONF_PATH" ]] || { echo "MTProxy config not found: $CONF_PATH" >&2; exit 1; }
+[[ -s "${MTPROXY_DIR}/proxy-secret" ]] || { echo "proxy-secret not found in ${MTPROXY_DIR}" >&2; exit 1; }
+[[ -s "${MTPROXY_DIR}/proxy-multi.conf" ]] || { echo "proxy-multi.conf not found in ${MTPROXY_DIR}" >&2; exit 1; }
+
+PORT="$(jq -r '.port // 2443' "$CONF_PATH")"
+INTERNAL_PORT="$(jq -r '.internal_port // 8888' "$CONF_PATH")"
+SECRET="$(jq -r '.secret // empty' "$CONF_PATH")"
+
+[[ "$PORT" =~ ^[0-9]{1,5}$ ]] || { echo "invalid port in $CONF_PATH: $PORT" >&2; exit 1; }
+[[ "$INTERNAL_PORT" =~ ^[0-9]{1,5}$ ]] || { echo "invalid internal_port in $CONF_PATH: $INTERNAL_PORT" >&2; exit 1; }
+[[ "$SECRET" =~ ^[A-Fa-f0-9]{32}$ ]] || { echo "invalid secret in $CONF_PATH: expected 32 hex chars" >&2; exit 1; }
+
+cd "$MTPROXY_DIR"
+exec "$BIN_PATH" -u nobody -p "$INTERNAL_PORT" -H "$PORT" -S "$SECRET" --aes-pwd proxy-secret proxy-multi.conf -M 1
+EOF
+  chmod 0755 /usr/local/bin/psas-mtproxy-run
+}
+
+configure_mtproxy() {
+  if [[ "${INSTALL_MTPROXY:-no}" != "yes" ]]; then
+    return
+  fi
+
+  [[ -x /opt/MTProxy/objs/bin/mtproto-proxy ]] || { err "mtproto-proxy binary not found in /opt/MTProxy/objs/bin"; exit 1; }
+  [[ -s /opt/MTProxy/proxy-secret ]] || { err "proxy-secret not found in /opt/MTProxy"; exit 1; }
+  [[ -s /opt/MTProxy/proxy-multi.conf ]] || { err "proxy-multi.conf not found in /opt/MTProxy"; exit 1; }
+
+  if [[ -z "${MTPROXY_SECRET:-}" ]]; then
+    MTPROXY_SECRET="$(openssl rand -hex 16)"
+  fi
+  if ! is_hex_secret_32 "$MTPROXY_SECRET"; then
+    err "MTProxy secret must be exactly 32 hex characters"
+    exit 1
+  fi
+  MTPROXY_SECRET="$(tr 'A-F' 'a-f' <<<"$MTPROXY_SECRET")"
+
+  mkdir -p /etc/psas
+  jq -nc \
+    --arg server "${MTPROXY_SERVER_HOST}" \
+    --arg secret "${MTPROXY_SECRET}" \
+    --argjson port "${MTPROXY_PORT}" \
+    --argjson internal_port "${MTPROXY_INTERNAL_PORT}" \
+    '{server:$server,port:$port,secret:$secret,internal_port:$internal_port}' >/etc/psas/mtproxy.json
+  chmod 0600 /etc/psas/mtproxy.json
+
+  cat >/etc/systemd/system/mtproxy.service <<'EOF'
+[Unit]
+Description=Telegram MTProxy (PSAS managed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/psas-mtproxy-run
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now mtproxy.service
+  systemctl restart mtproxy.service
+
+  cat >/root/mtproxy-credentials.txt <<EOF
+Telegram MTProxy credentials
+server=${MTPROXY_SERVER_HOST}
+port=${MTPROXY_PORT}
+secret=${MTPROXY_SECRET}
+service=mtproxy
+config=/etc/psas/mtproxy.json
+tg_link=tg://proxy?server=${MTPROXY_SERVER_HOST}&port=${MTPROXY_PORT}&secret=${MTPROXY_SECRET}
+share_url=https://t.me/proxy?server=${MTPROXY_SERVER_HOST}&port=${MTPROXY_PORT}&secret=${MTPROXY_SECRET}
+EOF
+  chmod 0600 /root/mtproxy-credentials.txt
+}
+
 configure_trusttunnel_endpoint() {
   if [[ "${INSTALL_TRUSTTUNNEL:-no}" != "yes" ]]; then
     return
@@ -1267,6 +1422,7 @@ configure_ufw() {
   local hy2_port="$1"
   local trust_port="${2:-}"
   local socks_port="${3:-}"
+  local mtproxy_port="${4:-}"
   ufw allow 22/tcp || true
   ufw allow 80/tcp || true
   ufw allow 443/tcp || true
@@ -1280,6 +1436,9 @@ configure_ufw() {
   fi
   if [[ -n "$socks_port" ]]; then
     ufw allow "${socks_port}/tcp" || true
+  fi
+  if [[ -n "$mtproxy_port" ]]; then
+    ufw allow "${mtproxy_port}/tcp" || true
   fi
 
   yes | ufw delete allow 1945 2>/dev/null || true
@@ -1346,6 +1505,13 @@ print_summary() {
       echo "TrustTunnel config file: /root/trusttunnel-endpoint-config.txt"
     fi
   fi
+  if [[ "${INSTALL_MTPROXY:-no}" == "yes" ]]; then
+    echo "MTProxy server: ${MTPROXY_SERVER_HOST}"
+    echo "MTProxy port: ${MTPROXY_PORT}"
+    echo "MTProxy internal port: ${MTPROXY_INTERNAL_PORT}"
+    echo "MTProxy secret: ${MTPROXY_SECRET}"
+    echo "MTProxy creds file: /root/mtproxy-credentials.txt"
+  fi
   echo
   echo "User management commands:"
   echo "  hiddify-sub list"
@@ -1373,6 +1539,15 @@ print_summary() {
     echo "  psasctl trust users show user01 --show-config"
     echo "  psasctl trust users del user01"
     echo "  psasctl trust service restart"
+  fi
+  if [[ "${INSTALL_MTPROXY:-no}" == "yes" ]]; then
+    echo
+    echo "Telegram MTProxy management commands:"
+    echo "  psasctl mtproxy status"
+    echo "  psasctl mtproxy config"
+    echo "  psasctl mtproxy secret show"
+    echo "  psasctl mtproxy secret regen"
+    echo "  psasctl mtproxy service restart"
   fi
   echo
   echo "Apply config safely after manual edits:"
@@ -1533,6 +1708,63 @@ prompt_inputs() {
     read -r -s -p "TrustTunnel initial password [auto-generated if empty]: " TRUSTTUNNEL_PASS
     echo
   fi
+
+  read -r -p "Install Telegram MTProxy too? [yes/no, default yes]: " INSTALL_MTPROXY
+  INSTALL_MTPROXY="${INSTALL_MTPROXY:-yes}"
+  if [[ "$INSTALL_MTPROXY" != "yes" && "$INSTALL_MTPROXY" != "no" ]]; then
+    err "INSTALL_MTPROXY must be yes or no"
+    exit 1
+  fi
+
+  if [[ "$INSTALL_MTPROXY" == "yes" ]]; then
+    read -r -p "MTProxy server host/domain for clients [${MAIN_DOMAIN}]: " MTPROXY_SERVER_HOST
+    MTPROXY_SERVER_HOST="${MTPROXY_SERVER_HOST:-$MAIN_DOMAIN}"
+    if [[ -z "$MTPROXY_SERVER_HOST" || "$MTPROXY_SERVER_HOST" =~ [[:space:]] ]]; then
+      err "Invalid MTProxy server host"
+      exit 1
+    fi
+
+    read -r -p "MTProxy listen port [2443]: " MTPROXY_PORT
+    MTPROXY_PORT="${MTPROXY_PORT:-2443}"
+    if ! is_port "$MTPROXY_PORT"; then
+      err "Invalid MTProxy port"
+      exit 1
+    fi
+    if [[ "$MTPROXY_PORT" == "80" || "$MTPROXY_PORT" == "443" ]]; then
+      err "MTProxy port ${MTPROXY_PORT} conflicts with Hiddify web ports 80/443"
+      exit 1
+    fi
+    if [[ "$MTPROXY_PORT" == "$HYSTERIA_BASE_PORT" || "$MTPROXY_PORT" == "$SPECIAL_BASE_PORT" ]]; then
+      err "MTProxy port ${MTPROXY_PORT} conflicts with Hiddify configured ports"
+      exit 1
+    fi
+    if [[ "${INSTALL_SOCKS5:-no}" == "yes" && "$MTPROXY_PORT" == "$SOCKS_PORT" ]]; then
+      err "MTProxy port ${MTPROXY_PORT} conflicts with SOCKS port ${SOCKS_PORT}"
+      exit 1
+    fi
+    if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" && "$MTPROXY_PORT" == "$TRUSTTUNNEL_PORT" ]]; then
+      err "MTProxy port ${MTPROXY_PORT} conflicts with TrustTunnel port ${TRUSTTUNNEL_PORT}"
+      exit 1
+    fi
+
+    read -r -p "MTProxy internal port (-p) [8888]: " MTPROXY_INTERNAL_PORT
+    MTPROXY_INTERNAL_PORT="${MTPROXY_INTERNAL_PORT:-8888}"
+    if ! is_port "$MTPROXY_INTERNAL_PORT"; then
+      err "Invalid MTProxy internal port"
+      exit 1
+    fi
+    if [[ "$MTPROXY_INTERNAL_PORT" == "$MTPROXY_PORT" ]]; then
+      err "MTProxy internal port must differ from listen port"
+      exit 1
+    fi
+
+    read -r -p "MTProxy secret HEX32 [auto-generated if empty]: " MTPROXY_SECRET
+    MTPROXY_SECRET="${MTPROXY_SECRET:-}"
+    if [[ -n "$MTPROXY_SECRET" ]] && ! is_hex_secret_32 "$MTPROXY_SECRET"; then
+      err "MTProxy secret must be exactly 32 hex chars"
+      exit 1
+    fi
+  fi
 }
 
 main() {
@@ -1547,6 +1779,7 @@ main() {
   backup_hiddify
   install_dante_if_needed
   install_trusttunnel_if_needed
+  install_mtproxy_if_needed
 
   if [[ "$DO_CLEANUP" == "yes" ]]; then
     cleanup_legacy
@@ -1561,6 +1794,10 @@ main() {
   if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" ]]; then
     write_trusttunnel_sub_script
   fi
+  if [[ "${INSTALL_MTPROXY:-no}" == "yes" ]]; then
+    write_mtproxy_sub_script
+    write_mtproxy_runner_script
+  fi
   setup_cert_sync_cron
 
   configure_panel_settings
@@ -1574,8 +1811,9 @@ main() {
   collect_state
   configure_dante_socks
   configure_trusttunnel_endpoint
+  configure_mtproxy
 
-  configure_ufw "$HY2_PORT" "${TRUSTTUNNEL_PORT:-}" "${SOCKS_PORT:-}"
+  configure_ufw "$HY2_PORT" "${TRUSTTUNNEL_PORT:-}" "${SOCKS_PORT:-}" "${MTPROXY_PORT:-}"
   configure_fail2ban
   configure_sysctl
 

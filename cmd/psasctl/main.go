@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,20 +26,26 @@ import (
 )
 
 const (
-	defaultPanelCfg      = "/opt/hiddify-manager/hiddify-panel/app.cfg"
-	defaultPanelAddr     = "http://127.0.0.1:9000"
-	defaultTrustDir      = "/opt/trusttunnel"
-	defaultTrustService  = "trusttunnel"
-	defaultTrustEndpoint = "trusttunnel_endpoint"
-	defaultSocksService  = "danted"
-	defaultSocksConfig   = "/etc/danted.conf"
-	defaultSocksUsers    = "/etc/psas/socks-users.json"
-	defaultSocksPort     = 1080
-	defaultUILang        = "us"
-	uiLangUS             = "us"
-	uiLangRU             = "ru"
-	unlimitedPackageDays = 10000
-	unlimitedUsageGB     = 1000000.0
+	defaultPanelCfg            = "/opt/hiddify-manager/hiddify-panel/app.cfg"
+	defaultPanelAddr           = "http://127.0.0.1:9000"
+	defaultTrustDir            = "/opt/trusttunnel"
+	defaultTrustService        = "trusttunnel"
+	defaultTrustEndpoint       = "trusttunnel_endpoint"
+	defaultMTProxyDir          = "/opt/MTProxy"
+	defaultMTProxyBin          = "mtproto-proxy"
+	defaultMTProxyService      = "mtproxy"
+	defaultMTProxyConfig       = "/etc/psas/mtproxy.json"
+	defaultMTProxyPort         = 2443
+	defaultMTProxyInternalPort = 8888
+	defaultSocksService        = "danted"
+	defaultSocksConfig         = "/etc/danted.conf"
+	defaultSocksUsers          = "/etc/psas/socks-users.json"
+	defaultSocksPort           = 1080
+	defaultUILang              = "us"
+	uiLangUS                   = "us"
+	uiLangRU                   = "ru"
+	unlimitedPackageDays       = 10000
+	unlimitedUsageGB           = 1000000.0
 )
 
 type state struct {
@@ -104,6 +111,40 @@ type trustStatus struct {
 	Users         int    `json:"users"`
 }
 
+type mtproxyClient struct {
+	dir     string
+	service string
+	config  string
+}
+
+type mtproxyConfig struct {
+	Server       string `json:"server"`
+	Port         int    `json:"port"`
+	Secret       string `json:"secret"`
+	InternalPort int    `json:"internal_port,omitempty"`
+}
+
+type mtproxyStatus struct {
+	Installed     bool   `json:"installed"`
+	Service       string `json:"service"`
+	ServiceActive bool   `json:"service_active"`
+	Directory     string `json:"directory"`
+	ConfigPath    string `json:"config_path"`
+	Server        string `json:"server,omitempty"`
+	ListenPort    int    `json:"listen_port,omitempty"`
+	InternalPort  int    `json:"internal_port,omitempty"`
+	SecretMasked  string `json:"secret_masked,omitempty"`
+}
+
+type mtproxyConnInfo struct {
+	Server       string `json:"server"`
+	Port         int    `json:"port"`
+	Secret       string `json:"secret"`
+	SecretMasked string `json:"secret_masked"`
+	TGLink       string `json:"tg_link"`
+	ShareURL     string `json:"share_url"`
+}
+
 type socksClient struct {
 	service string
 	config  string
@@ -166,6 +207,7 @@ var protocolSettings = []protocolSetting{
 }
 
 var uuidRe = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
+var mtproxySecretRe = regexp.MustCompile(`^[A-Fa-f0-9]{32}$`)
 var trustUserRe = regexp.MustCompile(`^[A-Za-z0-9._@-]{1,64}$`)
 var socksUserRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,30}$`)
 var dantedInternalRe = regexp.MustCompile(`(?i)^internal:\s*([^\s]+)(?:\s+port\s*=\s*([0-9]{1,5}))?\s*$`)
@@ -210,6 +252,7 @@ var uiTextRU = map[string]string{
 	"Flag command wizard":                          "Мастер флаговых команд",
 	"SOCKS5 (Dante)":                               "SOCKS5 (Dante)",
 	"TrustTunnel":                                  "TrustTunnel",
+	"Telegram MTProxy":                             "Telegram MTProxy",
 	"Main domain, admin URL, protocols, users count":                    "Основной домен, админ URL, протоколы, количество пользователей",
 	"Print all users in a table":                                        "Показать всех пользователей в таблице",
 	"Search users by name/part and optional enabled filter":             "Поиск пользователей по имени/части и фильтру enabled",
@@ -219,6 +262,7 @@ var uiTextRU = map[string]string{
 	"Pick a user and delete with confirmation":                          "Выберите пользователя и удалите с подтверждением",
 	"Manage SOCKS users and danted service":                             "Управление SOCKS-пользователями и сервисом danted",
 	"Manage TrustTunnel users and service":                              "Управление пользователями TrustTunnel и сервисом",
+	"Manage Telegram MTProxy service and secret":                        "Управление сервисом и секретом Telegram MTProxy",
 	"List and toggle protocol enable flags":                             "Список и переключение флагов протоколов",
 	"Print panel admin URL":                                             "Показать URL админ-панели",
 	"Run hiddify-apply-safe or panel apply":                             "Запустить hiddify-apply-safe или panel apply",
@@ -248,6 +292,9 @@ var uiTextRU = map[string]string{
 	"SOCKS service":                                                     "Сервис SOCKS",
 	"TrustTunnel status":                                                "Статус TrustTunnel",
 	"TrustTunnel users":                                                 "Пользователи TrustTunnel",
+	"MTProxy status":                                                    "Статус MTProxy",
+	"MTProxy config":                                                    "Конфиг MTProxy",
+	"MTProxy service":                                                   "Сервис MTProxy",
 	"System Status":                                                     "Системный статус",
 	"SOCKS5 config":                                                     "Конфиг SOCKS5",
 	"SOCKS User":                                                        "SOCKS пользователь",
@@ -273,6 +320,9 @@ var uiTextRU = map[string]string{
 	"Reality SNI":                                                       "Reality SNI",
 	"TrustTunnel active":                                                "TrustTunnel активен",
 	"TrustTunnel listen":                                                "TrustTunnel слушает",
+	"MTProxy installed":                                                 "MTProxy установлен",
+	"MTProxy active":                                                    "MTProxy активен",
+	"MTProxy endpoint":                                                  "Точка MTProxy",
 	"SOCKS active":                                                      "SOCKS активен",
 	"SOCKS listen":                                                      "SOCKS слушает",
 	"No users found.":                                                   "Пользователи не найдены.",
@@ -282,8 +332,13 @@ var uiTextRU = map[string]string{
 	"LOGIN":                                                             "ЛОГИН",
 	"Server":                                                            "Сервер",
 	"Port":                                                              "Порт",
+	"Internal port":                                                     "Внутренний порт",
 	"Login":                                                             "Логин",
 	"Password":                                                          "Пароль",
+	"Secret":                                                            "Секрет",
+	"Secret masked":                                                     "Секрет (маска)",
+	"tg:// link":                                                        "tg:// ссылка",
+	"Share URL":                                                         "Ссылка для шаринга",
 	"Username":                                                          "Имя пользователя",
 	"Service control":                                                   "Управление сервисом",
 	"Status / users / links / settings":                                 "Статус / пользователи / ссылки / настройки",
@@ -350,6 +405,18 @@ var uiTextRU = map[string]string{
 	"unknown trust action: %s":                          "неизвестное действие trust: %s",
 	"unknown action: %s":                                "неизвестное действие: %s",
 	"Warning: %s":                                       "Внимание: %s",
+	"Show MTProxy service/config summary":               "Показать статус MTProxy сервиса и конфига",
+	"Show config":                                       "Показать конфиг",
+	"Print server/port/secret and connect links":        "Показать сервер/порт/секрет и ссылки подключения",
+	"Set secret":                                        "Установить секрет",
+	"Set custom HEX32 secret and restart service":       "Установить HEX32 секрет и перезапустить сервис",
+	"Regenerate secret":                                 "Перегенерировать секрет",
+	"Generate random HEX32 secret and restart service":  "Сгенерировать случайный HEX32 секрет и перезапустить сервис",
+	"status/start/stop/restart mtproxy":                 "status/start/stop/restart mtproxy",
+	"Return to MTProxy menu":                            "Вернуться в меню MTProxy",
+	"MTProxy secret (HEX32)":                            "Секрет MTProxy (HEX32)",
+	"Server host/ip (empty = from config)":              "Сервер host/ip (пусто = из конфига)",
+	"Port (empty = from config)":                        "Порт (пусто = из конфига)",
 }
 
 func main() {
@@ -382,6 +449,8 @@ func main() {
 		runApply(args)
 	case "trust", "trusttunnel", "tt":
 		runTrust(args)
+	case "mtproxy", "mtp", "tgproxy":
+		runMTProxy(args)
 	case "socks", "socks5":
 		runSocks(args)
 	case "lang", "language":
@@ -424,6 +493,13 @@ Usage:
   psasctl trust users del <USER_ID>
   psasctl trust service <status|start|stop|restart>
   psasctl trust ui
+  psasctl mtproxy status [--json]
+  psasctl mtproxy config [--server HOST] [--port N] [--secret HEX32] [--json]
+  psasctl mtproxy secret show [--json]
+  psasctl mtproxy secret set <HEX32> [--json]
+  psasctl mtproxy secret regen [--json]
+  psasctl mtproxy service <status|start|stop|restart>
+  psasctl mtproxy ui
   psasctl socks status [--json]
   psasctl socks users list [--json]
   psasctl socks users add --name LOGIN [--password PASS] [--server HOST] [--port N] [--show-config] [--json]
@@ -444,6 +520,10 @@ Environment overrides:
   PSAS_PANEL_PY    (default auto-detect .venv313/.venv/python3)
   PSAS_TT_DIR      (default /opt/trusttunnel)
   PSAS_TT_SERVICE  (default trusttunnel)
+  PSAS_MTPROXY_DIR     (default /opt/MTProxy)
+  PSAS_MTPROXY_SERVICE (default mtproxy)
+  PSAS_MTPROXY_CONF    (default /etc/psas/mtproxy.json)
+  PSAS_MTPROXY_HOST    (override default host for mtproxy config output)
   PSAS_SOCKS_SERVICE (default danted)
   PSAS_SOCKS_CONF    (default /etc/danted.conf)
   PSAS_SOCKS_USERS   (default /etc/psas/socks-users.json)
@@ -477,6 +557,9 @@ func runStatus(args []string) {
 	if tt, err := newTrustClient().status(); err == nil {
 		out["trusttunnel"] = tt
 	}
+	if mtp, err := newMTProxyClient().status(); err == nil {
+		out["mtproxy"] = mtp
+	}
 	if sc, err := newSocksClient().status(); err == nil {
 		out["socks5"] = sc
 	}
@@ -499,6 +582,15 @@ func runStatus(args []string) {
 			fmt.Printf("TrustTunnel service active: %t\n", tt.ServiceActive)
 			fmt.Printf("TrustTunnel listen: %s\n", tt.ListenAddress)
 			fmt.Printf("TrustTunnel users: %d\n", tt.Users)
+		}
+	}
+	if mtp, err := newMTProxyClient().status(); err == nil {
+		fmt.Printf("MTProxy installed: %t\n", mtp.Installed)
+		if mtp.Installed {
+			fmt.Printf("MTProxy service active: %t\n", mtp.ServiceActive)
+			if mtp.Server != "" && mtp.ListenPort > 0 {
+				fmt.Printf("MTProxy endpoint: %s:%d\n", mtp.Server, mtp.ListenPort)
+			}
 		}
 	}
 	if sc, err := newSocksClient().status(); err == nil {
@@ -928,6 +1020,191 @@ func runTrust(args []string) {
 	default:
 		fatalf("unknown trust subcommand: %s", sub)
 	}
+}
+
+func runMTProxy(args []string) {
+	if len(args) < 1 {
+		fatalf("mtproxy requires subcommand: status|config|secret|service|ui")
+	}
+
+	mp := newMTProxyClient()
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	subArgs := args[1:]
+
+	switch sub {
+	case "status":
+		fs := flag.NewFlagSet("mtproxy status", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("mtproxy status takes no positional args")
+		}
+		st, err := mp.status()
+		must(err)
+		if *jsonOut {
+			printJSON(st)
+			return
+		}
+		printMTProxyStatus(st)
+	case "config", "show", "links":
+		fs := flag.NewFlagSet("mtproxy config", flag.ExitOnError)
+		server := fs.String("server", "", "server host/ip for generated links")
+		port := fs.Int("port", 0, "server port for generated links")
+		secret := fs.String("secret", "", "secret override (HEX32)")
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("mtproxy config takes only flags")
+		}
+		cfg, err := mp.connectionInfo(strings.TrimSpace(*server), *port, strings.TrimSpace(*secret))
+		must(err)
+		if *jsonOut {
+			printJSON(cfg)
+			return
+		}
+		printMTProxyConnInfo(cfg)
+	case "secret":
+		runMTProxySecret(mp, subArgs)
+	case "service", "svc":
+		runMTProxyService(mp, subArgs)
+	case "ui", "menu", "interactive":
+		runMTProxyUI(subArgs)
+	default:
+		fatalf("unknown mtproxy subcommand: %s", sub)
+	}
+}
+
+func runMTProxySecret(mp *mtproxyClient, args []string) {
+	if len(args) < 1 {
+		fatalf("mtproxy secret requires subcommand: show|set|regen")
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	subArgs := args[1:]
+
+	switch sub {
+	case "show":
+		fs := flag.NewFlagSet("mtproxy secret show", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("mtproxy secret show takes no positional args")
+		}
+		cfg, err := mp.loadConfig()
+		must(err)
+		secret, err := normalizeMTProxySecret(cfg.Secret)
+		must(err)
+		if *jsonOut {
+			printJSON(map[string]any{
+				"secret":        secret,
+				"secret_masked": maskSecret(secret),
+			})
+			return
+		}
+		fmt.Printf("Secret: %s\n", secret)
+	case "set":
+		fs := flag.NewFlagSet("mtproxy secret set", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		rest := fs.Args()
+		if len(rest) != 1 {
+			fatalf("mtproxy secret set requires <HEX32>")
+		}
+		must(requireRoot("mtproxy secret set"))
+
+		secret, err := normalizeMTProxySecret(rest[0])
+		must(err)
+		cfg, err := mp.loadConfig()
+		must(err)
+		cfg.Secret = secret
+		must(mp.writeConfig(cfg))
+		restartWarn := mtproxyRestartWarning(mp.service, mp.restartService())
+
+		resp := map[string]any{
+			"secret":        cfg.Secret,
+			"secret_masked": maskSecret(cfg.Secret),
+		}
+		if restartWarn != "" {
+			resp["restart_warning"] = restartWarn
+		}
+		if *jsonOut {
+			printJSON(resp)
+			return
+		}
+		fmt.Printf("MTProxy secret updated.\n")
+		fmt.Printf("Secret: %s\n", cfg.Secret)
+		if restartWarn != "" {
+			fmt.Printf("Warning: %s\n", restartWarn)
+		}
+	case "regen", "rotate":
+		fs := flag.NewFlagSet("mtproxy secret regen", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "output JSON")
+		must(fs.Parse(subArgs))
+		if len(fs.Args()) != 0 {
+			fatalf("mtproxy secret regen takes no positional args")
+		}
+		must(requireRoot("mtproxy secret regen"))
+
+		cfg, err := mp.loadConfig()
+		must(err)
+		cfg.Secret = newHexToken(16)
+		must(mp.writeConfig(cfg))
+		restartWarn := mtproxyRestartWarning(mp.service, mp.restartService())
+
+		resp := map[string]any{
+			"secret":        cfg.Secret,
+			"secret_masked": maskSecret(cfg.Secret),
+		}
+		if restartWarn != "" {
+			resp["restart_warning"] = restartWarn
+		}
+		if *jsonOut {
+			printJSON(resp)
+			return
+		}
+		fmt.Printf("MTProxy secret regenerated.\n")
+		fmt.Printf("Secret: %s\n", cfg.Secret)
+		if restartWarn != "" {
+			fmt.Printf("Warning: %s\n", restartWarn)
+		}
+	default:
+		fatalf("unknown mtproxy secret subcommand: %s", sub)
+	}
+}
+
+func runMTProxyService(mp *mtproxyClient, args []string) {
+	if len(args) != 1 {
+		fatalf("mtproxy service requires action: status|start|stop|restart")
+	}
+	action := strings.ToLower(strings.TrimSpace(args[0]))
+	switch action {
+	case "status":
+		must(runCommand("systemctl", "--no-pager", "--full", "status", mp.service))
+	case "start", "stop", "restart":
+		must(runCommand("systemctl", action, mp.service))
+		fmt.Printf("MTProxy service %s: %s\n", action, mp.service)
+	default:
+		fatalf("unknown mtproxy service action: %s (expected status|start|stop|restart)", action)
+	}
+}
+
+func runMTProxyUI(args []string) {
+	if len(args) != 0 {
+		fatalf("mtproxy ui takes no args")
+	}
+	if !isInteractiveTerminal() {
+		fatalf("mtproxy ui requires an interactive terminal")
+	}
+	in := bufio.NewReader(os.Stdin)
+	clearScreen()
+	printBoxedHeader("Telegram MTProxy")
+	if err := uiMTProxy(in); err != nil {
+		if errors.Is(err, errUISelectionCanceled) || errors.Is(err, errUIExitRequested) || errors.Is(err, io.EOF) {
+			clearScreen()
+			return
+		}
+		fatalf("mtproxy ui error: %v", err)
+	}
+	clearScreen()
 }
 
 func runSocks(args []string) {
@@ -1639,6 +1916,42 @@ func printSocksConnInfo(cfg socksConnInfo) {
 	fmt.Print(renderSocksConnInfo(cfg))
 }
 
+func printMTProxyStatus(st mtproxyStatus) {
+	fmt.Printf("%s: %t\n", uiText("MTProxy installed"), st.Installed)
+	fmt.Printf("%s: %s (active=%t)\n", uiText("Service"), st.Service, st.ServiceActive)
+	fmt.Printf("%s: %s\n", uiText("Directory"), st.Directory)
+	fmt.Printf("%s: %s\n", uiText("Config"), st.ConfigPath)
+	if st.Server != "" {
+		fmt.Printf("%s: %s\n", uiText("Server"), st.Server)
+	}
+	if st.ListenPort > 0 {
+		fmt.Printf("%s: %d\n", uiText("Port"), st.ListenPort)
+	}
+	if st.InternalPort > 0 {
+		fmt.Printf("%s: %d\n", uiText("Internal port"), st.InternalPort)
+	}
+	if st.SecretMasked != "" {
+		fmt.Printf("%s: %s\n", uiText("Secret"), st.SecretMasked)
+	}
+}
+
+func renderMTProxyConnInfo(cfg mtproxyConnInfo) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s: %s\n", uiText("Server"), cfg.Server)
+	fmt.Fprintf(&b, "%s: %d\n", uiText("Port"), cfg.Port)
+	fmt.Fprintf(&b, "%s: %s\n", uiText("Secret"), cfg.Secret)
+	fmt.Fprintf(&b, "%s: %s\n", uiText("Secret masked"), cfg.SecretMasked)
+	fmt.Fprintf(&b, "%s: %s\n", uiText("tg:// link"), cfg.TGLink)
+	fmt.Fprintf(&b, "%s: %s\n", uiText("Share URL"), cfg.ShareURL)
+	return b.String()
+}
+
+func printMTProxyConnInfo(cfg mtproxyConnInfo) {
+	fmt.Println(uiText("MTProxy config"))
+	fmt.Println("==============")
+	fmt.Print(renderMTProxyConnInfo(cfg))
+}
+
 func maskSecret(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -1655,6 +1968,13 @@ func trustRestartWarning(service string, err error) string {
 		return ""
 	}
 	return fmt.Sprintf("credentials saved, but failed to restart %s: %v", service, err)
+}
+
+func mtproxyRestartWarning(service string, err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf("config saved, but failed to restart %s: %v", service, err)
 }
 
 func protocolStates(cfg map[string]any) []protocolState {
@@ -1790,6 +2110,7 @@ func runUI(args []string) {
 		{Section: "Hiddify Manager", Key: "apply", Shortcut: 'p', Title: "Apply config", Hint: "Run hiddify-apply-safe or panel apply"},
 		{Section: "Proxy Services", Key: "socks", Shortcut: 'k', Title: "SOCKS5 (Dante)", Hint: "Manage SOCKS users and danted service"},
 		{Section: "Proxy Services", Key: "trust", Shortcut: 'r', Title: "TrustTunnel", Hint: "Manage TrustTunnel users and service"},
+		{Section: "Proxy Services", Key: "mtproxy", Shortcut: 'm', Title: "Telegram MTProxy", Hint: "Manage Telegram MTProxy service and secret"},
 		{Section: "Tools", Key: "wizard", Shortcut: 'w', Title: "Flag command wizard", Hint: "Build and run existing psasctl commands with their original flags"},
 		{Section: "Preferences", Key: "lang", Shortcut: 'g', Title: "Language", Hint: "Language and UI preferences"},
 		{Section: "Session", Key: "exit", Shortcut: 'q', Title: "Exit", Hint: "Leave interactive mode"},
@@ -1834,6 +2155,9 @@ func runUI(args []string) {
 			handledPause = true
 		case "trust":
 			actionErr = uiTrustTunnel(in)
+			handledPause = true
+		case "mtproxy":
+			actionErr = uiMTProxy(in)
 			handledPause = true
 		case "protocols":
 			actionErr = uiProtocols(c, in)
@@ -2294,6 +2618,11 @@ func uiRunFlagWizard(c *client, in *bufio.Reader) error {
 		{Value: "socks-users-config", Title: "socks users config", Hint: "Supports --server, --port, --out, --json + USER_ID"},
 		{Value: "socks-users-del", Title: "socks users del", Hint: "Delete by USER_ID"},
 		{Value: "socks-service", Title: "socks service", Hint: "Run status/start/stop/restart"},
+		{Value: "mtproxy-status", Title: "mtproxy status", Hint: "Supports --json"},
+		{Value: "mtproxy-config", Title: "mtproxy config", Hint: "Supports --server, --port, --secret, --json"},
+		{Value: "mtproxy-secret-show", Title: "mtproxy secret show", Hint: "Print current secret"},
+		{Value: "mtproxy-secret-regen", Title: "mtproxy secret regen", Hint: "Generate new secret and restart service"},
+		{Value: "mtproxy-service", Title: "mtproxy service", Hint: "Run status/start/stop/restart"},
 		{Value: "apply", Title: "apply", Hint: "Apply config safely"},
 	}
 
@@ -2913,6 +3242,78 @@ func uiBuildWizardArgs(c *client, choice string, in *bufio.Reader) ([]string, er
 			return nil, err
 		}
 		return []string{"socks", "service", action}, nil
+	case "mtproxy-status":
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"mtproxy", "status"}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "mtproxy-config":
+		server, err := promptLine(in, "Server (--server, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		port, err := promptLine(in, "Port (--port, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		secret, err := promptLine(in, "Secret HEX32 (--secret, optional)", "")
+		if err != nil {
+			return nil, err
+		}
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"mtproxy", "config"}
+		if strings.TrimSpace(server) != "" {
+			args = append(args, "--server", strings.TrimSpace(server))
+		}
+		if p := strings.TrimSpace(port); p != "" {
+			args = append(args, "--port", p)
+		}
+		if s := strings.TrimSpace(secret); s != "" {
+			args = append(args, "--secret", s)
+		}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "mtproxy-secret-show":
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"mtproxy", "secret", "show"}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "mtproxy-secret-regen":
+		jsonOut, err := promptYesNo(in, "Use --json output?", false)
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"mtproxy", "secret", "regen"}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		return args, nil
+	case "mtproxy-service":
+		action, err := uiSelectOptionValue("MTProxy service action", []uiOption{
+			{Value: "status", Title: "status", Hint: "Show systemctl status mtproxy"},
+			{Value: "start", Title: "start", Hint: "Start mtproxy service"},
+			{Value: "stop", Title: "stop", Hint: "Stop mtproxy service"},
+			{Value: "restart", Title: "restart", Hint: "Restart mtproxy service"},
+		}, 0, in)
+		if err != nil {
+			return nil, err
+		}
+		return []string{"mtproxy", "service", action}, nil
 	case "apply":
 		return []string{"apply"}, nil
 	default:
@@ -3685,6 +4086,15 @@ func uiStatus(c *client) error {
 			fmt.Printf("%s: %d\n", uiText("TrustTunnel users"), tt.Users)
 		}
 	}
+	if mtp, err := newMTProxyClient().status(); err == nil {
+		fmt.Printf("%s: %t\n", uiText("MTProxy installed"), mtp.Installed)
+		if mtp.Installed {
+			fmt.Printf("%s: %t\n", uiText("MTProxy active"), mtp.ServiceActive)
+			if mtp.Server != "" && mtp.ListenPort > 0 {
+				fmt.Printf("%s: %s:%d\n", uiText("MTProxy endpoint"), mtp.Server, mtp.ListenPort)
+			}
+		}
+	}
 	if sc, err := newSocksClient().status(); err == nil {
 		fmt.Printf("%s: %t\n", uiText("SOCKS installed"), sc.Installed)
 		if sc.Installed {
@@ -4188,6 +4598,173 @@ func uiDeleteUser(c *client, in *bufio.Reader) error {
 	}
 	fmt.Printf("\nDeleted: %s (%s)\n", u.UUID, u.Name)
 	return nil
+}
+
+func uiMTProxy(in *bufio.Reader) error {
+	mp := newMTProxyClient()
+	for {
+		action, err := uiSelectOptionValue("Telegram MTProxy", []uiOption{
+			{Value: "status", Title: "Status", Hint: "Show MTProxy service/config summary"},
+			{Value: "config", Title: "Show config", Hint: "Print server/port/secret and connect links"},
+			{Value: "set-secret", Title: "Set secret", Hint: "Set custom HEX32 secret and restart service"},
+			{Value: "regen-secret", Title: "Regenerate secret", Hint: "Generate random HEX32 secret and restart service"},
+			{Value: "service", Title: "Service control", Hint: "status/start/stop/restart mtproxy"},
+			{Value: "back", Title: "Back", Hint: "Return to main menu"},
+		}, 0, in)
+		if err != nil {
+			if errors.Is(err, errUISelectionCanceled) || errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+
+		var actionErr error
+		switch action {
+		case "back":
+			return nil
+		case "status":
+			actionErr = uiMTProxyStatus(mp)
+		case "config":
+			actionErr = uiMTProxyShowConfig(mp, in)
+		case "set-secret":
+			actionErr = uiMTProxySetSecret(mp, in)
+		case "regen-secret":
+			actionErr = uiMTProxyRegenSecret(mp)
+		case "service":
+			actionErr = uiMTProxyService(mp, in)
+		default:
+			actionErr = fmt.Errorf("unknown mtproxy action: %s", action)
+		}
+
+		if actionErr != nil {
+			if errors.Is(actionErr, errUISelectionCanceled) {
+				fmt.Println("\n" + uiText("Canceled."))
+			} else if errors.Is(actionErr, errUIExitRequested) || errors.Is(actionErr, io.EOF) {
+				return nil
+			} else {
+				fmt.Printf("\n%s: %v\n", uiText("ERROR"), actionErr)
+			}
+		}
+
+		if err := uiPause(in); err != nil {
+			if errors.Is(err, errUIExitRequested) || errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func uiMTProxyStatus(mp *mtproxyClient) error {
+	st, err := mp.status()
+	if err != nil {
+		return err
+	}
+	printSectionHeader("MTProxy status")
+	printMTProxyStatus(st)
+	return nil
+}
+
+func uiMTProxyShowConfig(mp *mtproxyClient, in *bufio.Reader) error {
+	server, err := promptLine(in, "Server host/ip (empty = from config)", "")
+	if err != nil {
+		return err
+	}
+	portRaw, err := promptLine(in, "Port (empty = from config)", "")
+	if err != nil {
+		return err
+	}
+	port := 0
+	if strings.TrimSpace(portRaw) != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(portRaw))
+		if err != nil {
+			return fmt.Errorf("invalid port: %s", strings.TrimSpace(portRaw))
+		}
+		port = n
+	}
+	cfg, err := mp.connectionInfo(strings.TrimSpace(server), port, "")
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	printMTProxyConnInfo(cfg)
+	return nil
+}
+
+func uiMTProxySetSecret(mp *mtproxyClient, in *bufio.Reader) error {
+	if err := requireRoot("mtproxy secret set"); err != nil {
+		return err
+	}
+	secretRaw, err := promptRequiredLine(in, "MTProxy secret (HEX32)")
+	if err != nil {
+		return err
+	}
+	secret, err := normalizeMTProxySecret(secretRaw)
+	if err != nil {
+		return err
+	}
+	cfg, err := mp.loadConfig()
+	if err != nil {
+		return err
+	}
+	cfg.Secret = secret
+	if err := mp.writeConfig(cfg); err != nil {
+		return err
+	}
+	fmt.Printf("MTProxy secret updated.\n")
+	fmt.Printf("Secret: %s\n", cfg.Secret)
+	if warn := mtproxyRestartWarning(mp.service, mp.restartService()); warn != "" {
+		fmt.Printf("Warning: %s\n", warn)
+	}
+	return nil
+}
+
+func uiMTProxyRegenSecret(mp *mtproxyClient) error {
+	if err := requireRoot("mtproxy secret regen"); err != nil {
+		return err
+	}
+	cfg, err := mp.loadConfig()
+	if err != nil {
+		return err
+	}
+	cfg.Secret = newHexToken(16)
+	if err := mp.writeConfig(cfg); err != nil {
+		return err
+	}
+	fmt.Printf("MTProxy secret regenerated.\n")
+	fmt.Printf("Secret: %s\n", cfg.Secret)
+	if warn := mtproxyRestartWarning(mp.service, mp.restartService()); warn != "" {
+		fmt.Printf("Warning: %s\n", warn)
+	}
+	return nil
+}
+
+func uiMTProxyService(mp *mtproxyClient, in *bufio.Reader) error {
+	action, err := uiSelectOptionValue("MTProxy service", []uiOption{
+		{Value: "status", Title: "status", Hint: "Show systemctl status"},
+		{Value: "start", Title: "start", Hint: "Start service"},
+		{Value: "stop", Title: "stop", Hint: "Stop service"},
+		{Value: "restart", Title: "restart", Hint: "Restart service"},
+		{Value: "back", Title: "back", Hint: "Return to MTProxy menu"},
+	}, 0, in)
+	if err != nil {
+		return err
+	}
+	if action == "back" {
+		return nil
+	}
+	switch action {
+	case "status":
+		return runCommand("systemctl", "--no-pager", "--full", "status", mp.service)
+	case "start", "stop", "restart":
+		if err := runCommand("systemctl", action, mp.service); err != nil {
+			return err
+		}
+		fmt.Printf("MTProxy service %s: %s\n", action, mp.service)
+		return nil
+	default:
+		return fmt.Errorf("unknown action: %s", action)
+	}
 }
 
 func uiSocksProxy(in *bufio.Reader) error {
@@ -4841,6 +5418,207 @@ func detectPanelPython() string {
 		}
 	}
 	return "python3"
+}
+
+func newMTProxyClient() *mtproxyClient {
+	return &mtproxyClient{
+		dir:     envOr("PSAS_MTPROXY_DIR", defaultMTProxyDir),
+		service: envOr("PSAS_MTPROXY_SERVICE", defaultMTProxyService),
+		config:  envOr("PSAS_MTPROXY_CONF", defaultMTProxyConfig),
+	}
+}
+
+func (m *mtproxyClient) status() (mtproxyStatus, error) {
+	st := mtproxyStatus{
+		Installed:  m.installed(),
+		Service:    m.service,
+		Directory:  m.dir,
+		ConfigPath: m.config,
+	}
+	if active, err := m.serviceIsActive(); err == nil {
+		st.ServiceActive = active
+	}
+	cfg, err := m.loadConfig()
+	if err == nil {
+		st.Server = cfg.Server
+		st.ListenPort = cfg.Port
+		st.InternalPort = cfg.InternalPort
+		st.SecretMasked = maskSecret(cfg.Secret)
+	}
+	return st, nil
+}
+
+func (m *mtproxyClient) installed() bool {
+	if fileExists(m.binaryPath()) {
+		return true
+	}
+	_, err := exec.LookPath(defaultMTProxyBin)
+	return err == nil
+}
+
+func (m *mtproxyClient) binaryPath() string {
+	return filepath.Join(m.dir, "objs", "bin", defaultMTProxyBin)
+}
+
+func (m *mtproxyClient) serviceIsActive() (bool, error) {
+	out, err := runCommandOutput("systemctl", "is-active", m.service)
+	state := strings.ToLower(strings.TrimSpace(out))
+	switch state {
+	case "active":
+		return true, nil
+	case "inactive", "failed", "activating", "deactivating", "not-found", "unknown":
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("systemctl is-active %s: %w (%s)", m.service, err, strings.TrimSpace(out))
+	}
+	return false, nil
+}
+
+func (m *mtproxyClient) restartService() error {
+	return runCommand("systemctl", "restart", m.service)
+}
+
+func (m *mtproxyClient) loadConfig() (mtproxyConfig, error) {
+	cfg := mtproxyConfig{
+		Server:       strings.TrimSpace(os.Getenv("PSAS_MTPROXY_HOST")),
+		Port:         defaultMTProxyPort,
+		InternalPort: defaultMTProxyInternalPort,
+	}
+	if fileExists(m.config) {
+		raw, err := os.ReadFile(m.config)
+		if err != nil {
+			return cfg, err
+		}
+		if strings.TrimSpace(string(raw)) != "" {
+			var parsed mtproxyConfig
+			if err := json.Unmarshal(raw, &parsed); err != nil {
+				return cfg, fmt.Errorf("parse %s: %w", m.config, err)
+			}
+			if strings.TrimSpace(parsed.Server) != "" {
+				cfg.Server = strings.TrimSpace(parsed.Server)
+			}
+			if parsed.Port > 0 {
+				cfg.Port = parsed.Port
+			}
+			if parsed.InternalPort > 0 {
+				cfg.InternalPort = parsed.InternalPort
+			}
+			if strings.TrimSpace(parsed.Secret) != "" {
+				secret, err := normalizeMTProxySecret(parsed.Secret)
+				if err != nil {
+					return cfg, err
+				}
+				cfg.Secret = secret
+			}
+		}
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return cfg, fmt.Errorf("invalid mtproxy port: %d", cfg.Port)
+	}
+	if cfg.InternalPort < 1 || cfg.InternalPort > 65535 {
+		return cfg, fmt.Errorf("invalid mtproxy internal port: %d", cfg.InternalPort)
+	}
+	return cfg, nil
+}
+
+func (m *mtproxyClient) writeConfig(cfg mtproxyConfig) error {
+	cfg.Server = strings.TrimSpace(cfg.Server)
+	if cfg.Server == "" {
+		if envHost := strings.TrimSpace(os.Getenv("PSAS_MTPROXY_HOST")); envHost != "" {
+			cfg.Server = envHost
+		}
+	}
+	if cfg.Port <= 0 {
+		cfg.Port = defaultMTProxyPort
+	}
+	if cfg.InternalPort <= 0 {
+		cfg.InternalPort = defaultMTProxyInternalPort
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("invalid mtproxy port: %d", cfg.Port)
+	}
+	if cfg.InternalPort < 1 || cfg.InternalPort > 65535 {
+		return fmt.Errorf("invalid mtproxy internal port: %d", cfg.InternalPort)
+	}
+	secret, err := normalizeMTProxySecret(cfg.Secret)
+	if err != nil {
+		return err
+	}
+	cfg.Secret = secret
+
+	payload, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(m.config), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(m.config, append(payload, '\n'), 0o600)
+}
+
+func (m *mtproxyClient) connectionInfo(server string, port int, secret string) (mtproxyConnInfo, error) {
+	cfg, err := m.loadConfig()
+	if err != nil {
+		return mtproxyConnInfo{}, err
+	}
+	if strings.TrimSpace(server) != "" {
+		cfg.Server = strings.TrimSpace(server)
+	}
+	if port > 0 {
+		cfg.Port = port
+	}
+	if strings.TrimSpace(secret) != "" {
+		cfg.Secret = strings.TrimSpace(secret)
+	}
+
+	cfg.Server = strings.TrimSpace(cfg.Server)
+	if cfg.Server == "" {
+		ip, err := detectPublicIPv4()
+		if err != nil {
+			return mtproxyConnInfo{}, err
+		}
+		cfg.Server = ip
+	}
+	if strings.ContainsAny(cfg.Server, " \t\r\n") {
+		return mtproxyConnInfo{}, fmt.Errorf("invalid server value: %q", cfg.Server)
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return mtproxyConnInfo{}, fmt.Errorf("invalid mtproxy port: %d", cfg.Port)
+	}
+	normalizedSecret, err := normalizeMTProxySecret(cfg.Secret)
+	if err != nil {
+		return mtproxyConnInfo{}, err
+	}
+	q := url.Values{}
+	q.Set("server", cfg.Server)
+	q.Set("port", strconv.Itoa(cfg.Port))
+	q.Set("secret", normalizedSecret)
+	return mtproxyConnInfo{
+		Server:       cfg.Server,
+		Port:         cfg.Port,
+		Secret:       normalizedSecret,
+		SecretMasked: maskSecret(normalizedSecret),
+		TGLink:       "tg://proxy?" + q.Encode(),
+		ShareURL:     "https://t.me/proxy?" + q.Encode(),
+	}, nil
+}
+
+func normalizeMTProxySecret(raw string) (string, error) {
+	secret := strings.ToLower(strings.TrimSpace(raw))
+	if !mtproxySecretRe.MatchString(secret) {
+		return "", fmt.Errorf("invalid MTProxy secret %q (expected 32 hex chars)", strings.TrimSpace(raw))
+	}
+	return secret, nil
+}
+
+func newHexToken(bytesLen int) string {
+	if bytesLen <= 0 {
+		bytesLen = 16
+	}
+	raw := make([]byte, bytesLen)
+	mustReadRand(raw)
+	return hex.EncodeToString(raw)
 }
 
 func newTrustClient() *trustClient {

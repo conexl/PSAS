@@ -8,7 +8,8 @@ PSAS (Personal Secure Auto Setup) — набор инструментов для
 - `hiddify-apply-safe` (устанавливается скриптом) — безопасное применение конфигов с финальной синхронизацией LE-сертификата.
 - `socks5-sub` (устанавливается скриптом) — thin-wrapper для `psasctl socks`.
 - `trusttunnel-sub` (устанавливается скриптом) — thin-wrapper для `psasctl trust`.
-- `cmd/psasctl` — Go CLI для управления Hiddify, SOCKS5 (Dante) и TrustTunnel.
+- `mtproxy-sub` (устанавливается скриптом) — thin-wrapper для `psasctl mtproxy`.
+- `cmd/psasctl` — Go CLI для управления Hiddify, SOCKS5 (Dante), TrustTunnel и Telegram MTProxy.
 
 ## 1) Быстрый старт
 
@@ -49,6 +50,7 @@ sudo ./psas-install.sh
   - `/etc/cron.d/sync-hiddify-cert`
 - Опционально устанавливает и настраивает Dante SOCKS5 (`danted`) с логином/паролем и хранением пользователей в `/etc/psas/socks-users.json`.
 - Опционально устанавливает и настраивает TrustTunnel (`/opt/trusttunnel`) на отдельном порту (по умолчанию `8443`) с отдельными пользователями.
+- Опционально устанавливает и настраивает Telegram MTProxy (`/opt/MTProxy`) с systemd-сервисом `mtproxy` и конфигом `/etc/psas/mtproxy.json`.
 
 ## 3) Админ-панель
 
@@ -148,6 +150,15 @@ psasctl socks users del socks01
 psasctl socks users config --server vpn.example.com socks01
 psasctl socks service restart
 psasctl socks ui
+
+# Telegram MTProxy
+psasctl mtproxy status
+psasctl mtproxy config
+psasctl mtproxy secret show
+psasctl mtproxy secret set <HEX32>
+psasctl mtproxy secret regen
+psasctl mtproxy service restart
+psasctl mtproxy ui
 ```
 
 Примечания:
@@ -163,10 +174,11 @@ psasctl u list
 Интерактивный режим:
 - `psasctl ui` (или `psasctl menu`) открывает clean-screen меню в терминале.
 - Навигация: `↑/↓` (или `j/k`), выбор `Enter`, выход `q`.
-- Быстрый выбор: клавиши `1-9` и hotkeys у пунктов меню.
-- Пункт `Flag command wizard` пошагово собирает стандартные команды (`status/users/config/apply/trust/socks`) и запускает их через тот же CLI, сохраняя оригинальную обработку флагов.
+- Быстрый выбор: введите номер пункта и нажмите `Enter`, либо используйте hotkey у пункта меню.
+- Пункт `Flag command wizard` пошагово собирает стандартные команды (`status/users/config/apply/trust/socks/mtproxy`) и запускает их через тот же CLI, сохраняя оригинальную обработку флагов.
 - Для TrustTunnel добавлен отдельный пункт `TrustTunnel` (status/list/add/edit/show/delete/service).
 - Для SOCKS5 добавлен отдельный пункт `SOCKS5 (Dante)` (status/list/add/edit/show/delete/service).
+- Для Telegram MTProxy добавлен отдельный пункт `Telegram MTProxy` (status/config/secret/service).
 - В `Show user`/`Delete user` есть picker пользователей: стрелки, фильтр набором текста, `Backspace`, ручной ввод по `i`.
 - В `Add user` режим тарифа (`no_reset|daily|weekly|monthly`) выбирается стрелками, есть опции безлимита по трафику и/или времени.
 - Все флаговые команды продолжают работать как раньше.
@@ -179,6 +191,10 @@ psasctl u list
 - `PSAS_SOCKS_CONF` (default `/etc/danted.conf`)
 - `PSAS_SOCKS_USERS` (default `/etc/psas/socks-users.json`)
 - `PSAS_SOCKS_HOST` (override host in generated SOCKS config)
+- `PSAS_MTPROXY_DIR` (default `/opt/MTProxy`)
+- `PSAS_MTPROXY_SERVICE` (default `mtproxy`)
+- `PSAS_MTPROXY_CONF` (default `/etc/psas/mtproxy.json`)
+- `PSAS_MTPROXY_HOST` (override host in generated MTProxy config/links)
 
 ## 6) Безопасное применение конфигов
 
