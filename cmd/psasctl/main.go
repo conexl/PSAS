@@ -541,10 +541,13 @@ func runStatus(args []string) {
 		fatalf("status takes no positional args")
 	}
 	c := mustClient(false)
+	// Status should be useful even when panel is down. Try to load state, but do not fail hard.
+	panelErr := c.loadState()
 	mainDomain := c.mainDomain()
 	cfg := c.currentConfig()
 
 	out := map[string]any{
+		"panel_loaded":      panelErr == nil,
 		"main_domain":        mainDomain,
 		"admin_url":          c.adminURL(mainDomain),
 		"client_path":        cfg["proxy_path_client"],
@@ -553,6 +556,9 @@ func runStatus(args []string) {
 		"hysteria_base_port": cfg["hysteria_port"],
 		"reality_sni":        cfg["reality_server_names"],
 		"users":              len(c.state.Users),
+	}
+	if panelErr != nil {
+		out["panel_error"] = panelErr.Error()
 	}
 	if tt, err := newTrustClient().status(); err == nil {
 		out["trusttunnel"] = tt
@@ -568,6 +574,9 @@ func runStatus(args []string) {
 		return
 	}
 
+	if panelErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: unable to load Hiddify panel state: %v\n", panelErr)
+	}
 	fmt.Printf("Main domain: %s\n", mainDomain)
 	fmt.Printf("Admin URL: %s\n", c.adminURL(mainDomain))
 	fmt.Printf("Client path: %v\n", cfg["proxy_path_client"])
@@ -2078,12 +2087,26 @@ func applyWithClient(c *client) error {
 			return err
 		}
 		fmt.Println("Applied with hiddify-apply-safe")
-		return nil
+	} else {
+		if err := runCommand("/opt/hiddify-manager/common/commander.py", "apply"); err != nil {
+			return err
+		}
+		fmt.Println("Applied with /opt/hiddify-manager/common/commander.py apply")
 	}
-	if err := runCommand("/opt/hiddify-manager/common/commander.py", "apply"); err != nil {
-		return err
+
+	// Best-effort: Hiddify apply may stop MTProxy via /opt/hiddify-manager/other/telegram/disable.sh
+	// even when MTProxy is managed separately by PSAS.
+	mp := newMTProxyClient()
+	if fileExists(mp.config) {
+		active, err := mp.serviceIsActive()
+		if err == nil && !active {
+			if err := runCommand("systemctl", "start", mp.service); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: unable to start MTProxy service (%s): %v\n", mp.service, err)
+			} else {
+				fmt.Printf("MTProxy service started: %s\n", mp.service)
+			}
+		}
 	}
-	fmt.Println("Applied with /opt/hiddify-manager/common/commander.py apply")
 	return nil
 }
 

@@ -48,7 +48,7 @@ sudo ./psas-install.sh
   - `/usr/local/sbin/sync-hiddify-cert.sh`
 - Настраивает cron на синхронизацию LE-сертификата в Hiddify:
   - `/etc/cron.d/sync-hiddify-cert`
-- Опционально устанавливает и настраивает Dante SOCKS5 (`danted`) с логином/паролем и хранением пользователей в `/etc/psas/socks-users.json`.
+- Опционально устанавливает и настраивает Dante SOCKS5 (`danted`) с логином/паролем и хранением пользователей в `/etc/psas/socks-users.json`, включая `udp.portrange` (по умолчанию `20000-50000`) для звонков и соответствующее правило UFW.
 - Опционально устанавливает и настраивает TrustTunnel (`/opt/trusttunnel`) на отдельном порту (по умолчанию `8443`) с отдельными пользователями.
 - Опционально устанавливает и настраивает Telegram MTProxy (`/opt/MTProxy`) с systemd-сервисом `mtproxy` и конфигом `/etc/psas/mtproxy.json`.
 

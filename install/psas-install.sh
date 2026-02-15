@@ -30,6 +30,14 @@ is_port() {
   ((p >= 1 && p <= 65535))
 }
 
+is_port_range() {
+  local r="${1:-}" from to
+  [[ "$r" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
+  from="${BASH_REMATCH[1]}"
+  to="${BASH_REMATCH[2]}"
+  ((from >= 1 && to <= 65535 && from < to))
+}
+
 is_socks_login() {
   [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]
 }
@@ -176,6 +184,12 @@ configure_dante_socks() {
     return
   fi
 
+  SOCKS_UDP_PORTRANGE="${SOCKS_UDP_PORTRANGE:-20000-50000}"
+  if ! is_port_range "$SOCKS_UDP_PORTRANGE"; then
+    err "Invalid SOCKS UDP portrange: ${SOCKS_UDP_PORTRANGE} (expected START-END, e.g. 20000-50000)"
+    exit 1
+  fi
+
   if [[ -z "${SOCKS_PASS:-}" ]]; then
     SOCKS_PASS="$(random_alnum 20)"
   fi
@@ -202,6 +216,7 @@ configure_dante_socks() {
 logoutput: syslog
 
 internal: 0.0.0.0 port = ${SOCKS_PORT}
+external.protocol: ipv4
 external: ${SOCKS_IFACE}
 
 clientmethod: none
@@ -218,6 +233,7 @@ client pass {
 socks pass {
   from: 0.0.0.0/0 to: 0.0.0.0/0
   command: connect udpassociate bind
+  udp.portrange: ${SOCKS_UDP_PORTRANGE}
   log: error connect disconnect
 }
 EOF
@@ -248,6 +264,7 @@ username=${SOCKS_USER}
 password=${SOCKS_PASS}
 service=danted
 users_file=/etc/psas/socks-users.json
+udp_portrange=${SOCKS_UDP_PORTRANGE}
 EOF
   chmod 0600 /root/socks5-credentials.txt
 }
@@ -1423,6 +1440,7 @@ configure_ufw() {
   local trust_port="${2:-}"
   local socks_port="${3:-}"
   local mtproxy_port="${4:-}"
+  local socks_udp_portrange="${5:-}"
   ufw allow 22/tcp || true
   ufw allow 80/tcp || true
   ufw allow 443/tcp || true
@@ -1436,6 +1454,10 @@ configure_ufw() {
   fi
   if [[ -n "$socks_port" ]]; then
     ufw allow "${socks_port}/tcp" || true
+    ufw allow "${socks_port}/udp" || true
+    if [[ -n "$socks_udp_portrange" ]]; then
+      ufw allow "${socks_udp_portrange}/udp" || true
+    fi
   fi
   if [[ -n "$mtproxy_port" ]]; then
     ufw allow "${mtproxy_port}/tcp" || true
@@ -1491,6 +1513,7 @@ print_summary() {
   if [[ "${INSTALL_SOCKS5:-no}" == "yes" ]]; then
     echo "SOCKS5 server: ${SOCKS_SERVER_HOST}"
     echo "SOCKS5 port: ${SOCKS_PORT}"
+    echo "SOCKS5 UDP relay range: ${SOCKS_UDP_PORTRANGE:-20000-50000}"
     echo "SOCKS5 username: ${SOCKS_USER}"
     echo "SOCKS5 password: ${SOCKS_PASS}"
     echo "SOCKS5 creds file: /root/socks5-credentials.txt"
@@ -1662,6 +1685,13 @@ prompt_inputs() {
         exit 1
       fi
     fi
+
+    read -r -p "SOCKS UDP relay portrange [20000-50000]: " SOCKS_UDP_PORTRANGE
+    SOCKS_UDP_PORTRANGE="${SOCKS_UDP_PORTRANGE:-20000-50000}"
+    if ! is_port_range "$SOCKS_UDP_PORTRANGE"; then
+      err "Invalid SOCKS UDP portrange. Expected START-END, e.g. 20000-50000"
+      exit 1
+    fi
   fi
 
   read -r -p "Install TrustTunnel endpoint too? [yes/no, default yes]: " INSTALL_TRUSTTUNNEL
@@ -1813,7 +1843,7 @@ main() {
   configure_trusttunnel_endpoint
   configure_mtproxy
 
-  configure_ufw "$HY2_PORT" "${TRUSTTUNNEL_PORT:-}" "${SOCKS_PORT:-}" "${MTPROXY_PORT:-}"
+  configure_ufw "$HY2_PORT" "${TRUSTTUNNEL_PORT:-}" "${SOCKS_PORT:-}" "${MTPROXY_PORT:-}" "${SOCKS_UDP_PORTRANGE:-}"
   configure_fail2ban
   configure_sysctl
 
