@@ -52,6 +52,32 @@ install_prereqs() {
   apt-get install -y curl jq openssl ufw fail2ban ca-certificates uuid-runtime python3
 }
 
+installer_usage() {
+  cat <<'TXT'
+Usage:
+  bash install/psas-install.sh [FLAGS]
+
+Flags:
+  --hiddify-only     Install only Hiddify (no SOCKS5/TrustTunnel/MTProxy)
+  --socks5           Install Dante SOCKS5
+  --trusttunnel      Install TrustTunnel endpoint
+  --mtproxy          Install Telegram MTProxy
+  --no-cleanup       Do not remove legacy leftovers
+  --non-interactive  No prompts (use defaults and env vars)
+  --all              Full installation (default when no component flags are set)
+  -h, --help         Show this help
+
+Non-interactive required env vars:
+  MAIN_DOMAIN, ADMIN_PASS
+Optional env vars:
+  REALITY_SNI, ADMIN_USER, HYSTERIA_BASE_PORT, SPECIAL_BASE_PORT, ROTATE_ADMIN,
+  SOCKS_SERVER_HOST, SOCKS_PORT, SOCKS_USER, SOCKS_PASS, SOCKS_UDP_PORTRANGE,
+  TRUSTTUNNEL_DOMAIN, TRUSTTUNNEL_PORT, TRUSTTUNNEL_USER, TRUSTTUNNEL_PASS,
+  MTPROXY_SERVER_HOST, MTPROXY_PORT, MTPROXY_INTERNAL_PORT, MTPROXY_SECRET,
+  DO_CLEANUP, INSTALL_SOCKS5, INSTALL_TRUSTTUNNEL, INSTALL_MTPROXY
+TXT
+}
+
 install_hiddify_if_needed() {
   if [[ -d /opt/hiddify-manager ]]; then
     info "Hiddify detected in /opt/hiddify-manager"
@@ -1633,14 +1659,18 @@ prompt_inputs() {
     exit 1
   fi
 
-  read -r -p "Cleanup legacy leftovers (x-ui, v2raya, shadowsocks-libev)? [yes/no, default yes]: " DO_CLEANUP
+  if [[ -z "${DO_CLEANUP:-}" ]]; then
+    read -r -p "Cleanup legacy leftovers (x-ui, v2raya, shadowsocks-libev)? [yes/no, default yes]: " DO_CLEANUP
+  fi
   DO_CLEANUP="${DO_CLEANUP:-yes}"
   if [[ "$DO_CLEANUP" != "yes" && "$DO_CLEANUP" != "no" ]]; then
     err "DO_CLEANUP must be yes or no"
     exit 1
   fi
 
-  read -r -p "Install Dante SOCKS5 proxy too? [yes/no, default yes]: " INSTALL_SOCKS5
+  if [[ -z "${INSTALL_SOCKS5:-}" ]]; then
+    read -r -p "Install Dante SOCKS5 proxy too? [yes/no, default yes]: " INSTALL_SOCKS5
+  fi
   INSTALL_SOCKS5="${INSTALL_SOCKS5:-yes}"
   if [[ "$INSTALL_SOCKS5" != "yes" && "$INSTALL_SOCKS5" != "no" ]]; then
     err "INSTALL_SOCKS5 must be yes or no"
@@ -1694,7 +1724,9 @@ prompt_inputs() {
     fi
   fi
 
-  read -r -p "Install TrustTunnel endpoint too? [yes/no, default yes]: " INSTALL_TRUSTTUNNEL
+  if [[ -z "${INSTALL_TRUSTTUNNEL:-}" ]]; then
+    read -r -p "Install TrustTunnel endpoint too? [yes/no, default yes]: " INSTALL_TRUSTTUNNEL
+  fi
   INSTALL_TRUSTTUNNEL="${INSTALL_TRUSTTUNNEL:-yes}"
   if [[ "$INSTALL_TRUSTTUNNEL" != "yes" && "$INSTALL_TRUSTTUNNEL" != "no" ]]; then
     err "INSTALL_TRUSTTUNNEL must be yes or no"
@@ -1739,7 +1771,9 @@ prompt_inputs() {
     echo
   fi
 
-  read -r -p "Install Telegram MTProxy too? [yes/no, default yes]: " INSTALL_MTPROXY
+  if [[ -z "${INSTALL_MTPROXY:-}" ]]; then
+    read -r -p "Install Telegram MTProxy too? [yes/no, default yes]: " INSTALL_MTPROXY
+  fi
   INSTALL_MTPROXY="${INSTALL_MTPROXY:-yes}"
   if [[ "$INSTALL_MTPROXY" != "yes" && "$INSTALL_MTPROXY" != "no" ]]; then
     err "INSTALL_MTPROXY must be yes or no"
@@ -1797,9 +1831,223 @@ prompt_inputs() {
   fi
 }
 
+inputs_non_interactive() {
+  MAIN_DOMAIN="${MAIN_DOMAIN:-}"
+  if ! is_domain "$MAIN_DOMAIN"; then
+    err "Invalid or missing MAIN_DOMAIN"
+    exit 1
+  fi
+
+  REALITY_SNI="${REALITY_SNI:-www.cloudflare.com}"
+
+  ADMIN_USER="${ADMIN_USER:-psas-admin}"
+  if ! [[ "$ADMIN_USER" =~ ^[A-Za-z0-9._-]{3,64}$ ]]; then
+    err "Admin username must match [A-Za-z0-9._-]{3,64}"
+    exit 1
+  fi
+
+  ADMIN_PASS="${ADMIN_PASS:-}"
+  if [[ -z "$ADMIN_PASS" ]]; then
+    err "ADMIN_PASS is required in non-interactive mode"
+    exit 1
+  fi
+
+  HYSTERIA_BASE_PORT="${HYSTERIA_BASE_PORT:-40718}"
+  if ! is_port "$HYSTERIA_BASE_PORT"; then
+    err "Invalid hysteria base port"
+    exit 1
+  fi
+
+  SPECIAL_BASE_PORT="${SPECIAL_BASE_PORT:-12504}"
+  if ! is_port "$SPECIAL_BASE_PORT"; then
+    err "Invalid special base port"
+    exit 1
+  fi
+
+  ROTATE_ADMIN="${ROTATE_ADMIN:-yes}"
+  if [[ "$ROTATE_ADMIN" != "yes" && "$ROTATE_ADMIN" != "no" ]]; then
+    err "ROTATE_ADMIN must be yes or no"
+    exit 1
+  fi
+
+  DO_CLEANUP="${DO_CLEANUP:-yes}"
+  if [[ "$DO_CLEANUP" != "yes" && "$DO_CLEANUP" != "no" ]]; then
+    err "DO_CLEANUP must be yes or no"
+    exit 1
+  fi
+
+  if [[ "${INSTALL_SOCKS5:-no}" == "yes" ]]; then
+    SOCKS_SERVER_HOST="${SOCKS_SERVER_HOST:-$MAIN_DOMAIN}"
+    if [[ -z "$SOCKS_SERVER_HOST" || "$SOCKS_SERVER_HOST" =~ [[:space:]] ]]; then
+      err "Invalid SOCKS server host"
+      exit 1
+    fi
+
+    SOCKS_PORT="${SOCKS_PORT:-1080}"
+    if ! is_port "$SOCKS_PORT"; then
+      err "Invalid SOCKS port"
+      exit 1
+    fi
+    if [[ "$SOCKS_PORT" == "80" || "$SOCKS_PORT" == "443" ]]; then
+      err "SOCKS port ${SOCKS_PORT} conflicts with Hiddify web ports 80/443"
+      exit 1
+    fi
+    if [[ "$SOCKS_PORT" == "$HYSTERIA_BASE_PORT" || "$SOCKS_PORT" == "$SPECIAL_BASE_PORT" ]]; then
+      err "SOCKS port ${SOCKS_PORT} conflicts with Hiddify configured ports"
+      exit 1
+    fi
+
+    SOCKS_USER="${SOCKS_USER:-socks01}"
+    if ! is_socks_login "$SOCKS_USER"; then
+      err "SOCKS username must match [a-z_][a-z0-9_-]{0,30}"
+      exit 1
+    fi
+
+    SOCKS_PASS="${SOCKS_PASS:-}"
+    if [[ -n "$SOCKS_PASS" ]]; then
+      if [[ "$SOCKS_PASS" == *:* || "$SOCKS_PASS" == *$'\n'* || "$SOCKS_PASS" == *$'\r'* ]]; then
+        err "SOCKS password must not contain ':' or line breaks"
+        exit 1
+      fi
+    fi
+
+    SOCKS_UDP_PORTRANGE="${SOCKS_UDP_PORTRANGE:-20000-50000}"
+    if ! is_port_range "$SOCKS_UDP_PORTRANGE"; then
+      err "Invalid SOCKS UDP portrange. Expected START-END, e.g. 20000-50000"
+      exit 1
+    fi
+  fi
+
+  if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" ]]; then
+    TRUSTTUNNEL_DOMAIN="${TRUSTTUNNEL_DOMAIN:-$MAIN_DOMAIN}"
+    if ! is_domain "$TRUSTTUNNEL_DOMAIN"; then
+      err "Invalid TrustTunnel domain: $TRUSTTUNNEL_DOMAIN"
+      exit 1
+    fi
+
+    TRUSTTUNNEL_PORT="${TRUSTTUNNEL_PORT:-8443}"
+    if ! is_port "$TRUSTTUNNEL_PORT"; then
+      err "Invalid TrustTunnel port"
+      exit 1
+    fi
+    if [[ "$TRUSTTUNNEL_PORT" == "80" || "$TRUSTTUNNEL_PORT" == "443" ]]; then
+      err "TrustTunnel port ${TRUSTTUNNEL_PORT} conflicts with Hiddify web ports 80/443"
+      exit 1
+    fi
+    if [[ "$TRUSTTUNNEL_PORT" == "$HYSTERIA_BASE_PORT" || "$TRUSTTUNNEL_PORT" == "$SPECIAL_BASE_PORT" ]]; then
+      err "TrustTunnel port ${TRUSTTUNNEL_PORT} conflicts with Hiddify configured ports"
+      exit 1
+    fi
+    if [[ "${INSTALL_SOCKS5:-no}" == "yes" && "$TRUSTTUNNEL_PORT" == "$SOCKS_PORT" ]]; then
+      err "TrustTunnel port ${TRUSTTUNNEL_PORT} conflicts with SOCKS port ${SOCKS_PORT}"
+      exit 1
+    fi
+
+    TRUSTTUNNEL_USER="${TRUSTTUNNEL_USER:-ttadmin}"
+    if ! [[ "$TRUSTTUNNEL_USER" =~ ^[A-Za-z0-9._@-]{1,64}$ ]]; then
+      err "TrustTunnel username must match [A-Za-z0-9._@-]{1,64}"
+      exit 1
+    fi
+
+    TRUSTTUNNEL_PASS="${TRUSTTUNNEL_PASS:-}"
+  fi
+
+  if [[ "${INSTALL_MTPROXY:-no}" == "yes" ]]; then
+    MTPROXY_SERVER_HOST="${MTPROXY_SERVER_HOST:-$MAIN_DOMAIN}"
+    if [[ -z "$MTPROXY_SERVER_HOST" || "$MTPROXY_SERVER_HOST" =~ [[:space:]] ]]; then
+      err "Invalid MTProxy server host"
+      exit 1
+    fi
+
+    MTPROXY_PORT="${MTPROXY_PORT:-2443}"
+    if ! is_port "$MTPROXY_PORT"; then
+      err "Invalid MTProxy port"
+      exit 1
+    fi
+    if [[ "$MTPROXY_PORT" == "80" || "$MTPROXY_PORT" == "443" ]]; then
+      err "MTProxy port ${MTPROXY_PORT} conflicts with Hiddify web ports 80/443"
+      exit 1
+    fi
+    if [[ "$MTPROXY_PORT" == "$HYSTERIA_BASE_PORT" || "$MTPROXY_PORT" == "$SPECIAL_BASE_PORT" ]]; then
+      err "MTProxy port ${MTPROXY_PORT} conflicts with Hiddify configured ports"
+      exit 1
+    fi
+    if [[ "${INSTALL_SOCKS5:-no}" == "yes" && "$MTPROXY_PORT" == "$SOCKS_PORT" ]]; then
+      err "MTProxy port ${MTPROXY_PORT} conflicts with SOCKS port ${SOCKS_PORT}"
+      exit 1
+    fi
+    if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" && "$MTPROXY_PORT" == "$TRUSTTUNNEL_PORT" ]]; then
+      err "MTProxy port ${MTPROXY_PORT} conflicts with TrustTunnel port ${TRUSTTUNNEL_PORT}"
+      exit 1
+    fi
+
+    MTPROXY_INTERNAL_PORT="${MTPROXY_INTERNAL_PORT:-8888}"
+    if ! is_port "$MTPROXY_INTERNAL_PORT"; then
+      err "Invalid MTProxy internal port"
+      exit 1
+    fi
+    if [[ "$MTPROXY_INTERNAL_PORT" == "$MTPROXY_PORT" ]]; then
+      err "MTProxy internal port must differ from listen port"
+      exit 1
+    fi
+
+    MTPROXY_SECRET="${MTPROXY_SECRET:-}"
+    if [[ -n "$MTPROXY_SECRET" ]] && ! is_hex_secret_32 "$MTPROXY_SECRET"; then
+      err "MTProxy secret must be exactly 32 hex chars"
+      exit 1
+    fi
+  fi
+}
+
 main() {
   require_root
-  prompt_inputs
+  local non_interactive=0 all=0 custom=0 hiddify_only=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --hiddify-only) hiddify_only=1; shift ;;
+      --socks5) INSTALL_SOCKS5=yes; custom=1; shift ;;
+      --trusttunnel) INSTALL_TRUSTTUNNEL=yes; custom=1; shift ;;
+      --mtproxy) INSTALL_MTPROXY=yes; custom=1; shift ;;
+      --no-cleanup) DO_CLEANUP=no; shift ;;
+      --non-interactive) non_interactive=1; shift ;;
+      --all) all=1; shift ;;
+      -h|--help) installer_usage; exit 0 ;;
+      *) err "Unknown flag: $1"; installer_usage; exit 1 ;;
+    esac
+  done
+
+  if (( all && hiddify_only )); then
+    err "--all and --hiddify-only cannot be used together"
+    exit 1
+  fi
+  if (( hiddify_only && custom )); then
+    err "--hiddify-only cannot be combined with component flags"
+    exit 1
+  fi
+
+  if (( all )); then
+    INSTALL_SOCKS5=yes
+    INSTALL_TRUSTTUNNEL=yes
+    INSTALL_MTPROXY=yes
+  elif (( hiddify_only )); then
+    INSTALL_SOCKS5=no
+    INSTALL_TRUSTTUNNEL=no
+    INSTALL_MTPROXY=no
+  elif (( custom )); then
+    INSTALL_SOCKS5="${INSTALL_SOCKS5:-no}"
+    INSTALL_TRUSTTUNNEL="${INSTALL_TRUSTTUNNEL:-no}"
+    INSTALL_MTPROXY="${INSTALL_MTPROXY:-no}"
+  else
+    INSTALL_SOCKS5="${INSTALL_SOCKS5:-yes}"
+    INSTALL_TRUSTTUNNEL="${INSTALL_TRUSTTUNNEL:-yes}"
+    INSTALL_MTPROXY="${INSTALL_MTPROXY:-yes}"
+  fi
+
+  if (( non_interactive )); then
+    inputs_non_interactive
+  else
+    prompt_inputs
+  fi
 
   install_prereqs
   install_hiddify_if_needed
