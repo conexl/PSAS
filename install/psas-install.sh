@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_VERSION="0.4.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PSAS_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*"; }
@@ -49,7 +51,33 @@ is_hex_secret_32() {
 install_prereqs() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl jq openssl ufw fail2ban ca-certificates uuid-runtime python3
+  apt-get install -y curl jq openssl ufw fail2ban ca-certificates uuid-runtime python3 golang-go certbot
+}
+
+install_psasctl_if_possible() {
+  local src_root="${PSAS_ROOT}"
+
+  if command -v psasctl >/dev/null 2>&1; then
+    info "psasctl detected: $(command -v psasctl)"
+    return
+  fi
+
+  if [[ ! -f "${src_root}/go.mod" || ! -d "${src_root}/cmd/psasctl" ]]; then
+    warn "psasctl sources not found at ${src_root}; skipping psasctl build"
+    return
+  fi
+
+  if ! command -v go >/dev/null 2>&1; then
+    warn "Go toolchain is not available; cannot build psasctl"
+    return
+  fi
+
+  info "Building and installing psasctl from ${src_root}"
+  (
+    cd "${src_root}"
+    go build -o /usr/local/bin/psasctl ./cmd/psasctl
+  )
+  chmod 0755 /usr/local/bin/psasctl
 }
 
 installer_usage() {
@@ -72,6 +100,7 @@ Non-interactive required env vars:
 Optional env vars:
   REALITY_SNI, ADMIN_USER, HYSTERIA_BASE_PORT, SPECIAL_BASE_PORT, ROTATE_ADMIN,
   SOCKS_SERVER_HOST, SOCKS_PORT, SOCKS_USER, SOCKS_PASS, SOCKS_UDP_PORTRANGE,
+  ACME_EMAIL,
   TRUSTTUNNEL_DOMAIN, TRUSTTUNNEL_PORT, TRUSTTUNNEL_USER, TRUSTTUNNEL_PASS,
   MTPROXY_SERVER_HOST, MTPROXY_PORT, MTPROXY_INTERNAL_PORT, MTPROXY_SECRET,
   DO_CLEANUP, INSTALL_SOCKS5, INSTALL_TRUSTTUNNEL, INSTALL_MTPROXY
@@ -120,6 +149,69 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 41 3 * * * root systemctl restart trusttunnel.service >/dev/null 2>&1 || true
 EOF
   chmod 0644 /etc/cron.d/reload-trusttunnel-cert
+}
+
+request_letsencrypt_cert() {
+  local domain="${1:-}"
+  [[ -n "$domain" ]] || return 0
+
+  if ! is_domain "$domain"; then
+    warn "Skipping Let's Encrypt request: invalid domain ${domain}"
+    return 0
+  fi
+  if [[ -s "/etc/letsencrypt/live/${domain}/fullchain.pem" && -s "/etc/letsencrypt/live/${domain}/privkey.pem" ]]; then
+    info "Let's Encrypt certificate already exists for ${domain}"
+    return 0
+  fi
+  if ! command -v certbot >/dev/null 2>&1; then
+    warn "certbot is not installed; cannot request Let's Encrypt certificate for ${domain}"
+    return 0
+  fi
+
+  info "Requesting Let's Encrypt certificate for ${domain}"
+  local haproxy_was_active="no"
+  local nginx_was_active="no"
+  local cert_ok=0
+
+  if systemctl is-active --quiet hiddify-haproxy.service; then
+    haproxy_was_active="yes"
+    systemctl stop hiddify-haproxy.service || true
+  fi
+  if systemctl is-active --quiet nginx.service; then
+    nginx_was_active="yes"
+    systemctl stop nginx.service || true
+  fi
+
+  local certbot_args=(certonly --standalone -d "$domain" --non-interactive --agree-tos --keep-until-expiring)
+  if [[ -n "${ACME_EMAIL:-}" ]]; then
+    certbot_args+=(--email "$ACME_EMAIL")
+  else
+    certbot_args+=(--register-unsafely-without-email)
+  fi
+
+  if certbot "${certbot_args[@]}"; then
+    cert_ok=1
+    info "Let's Encrypt certificate issued for ${domain}"
+  else
+    warn "Failed to issue Let's Encrypt certificate for ${domain}; continuing without LE"
+  fi
+
+  if [[ "$nginx_was_active" == "yes" ]]; then
+    systemctl start nginx.service || true
+  fi
+  if [[ "$haproxy_was_active" == "yes" ]]; then
+    systemctl start hiddify-haproxy.service || true
+  fi
+
+  if (( cert_ok )); then
+    install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+    cat >/etc/letsencrypt/renewal-hooks/deploy/restart-trusttunnel.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl restart trusttunnel.service >/dev/null 2>&1 || true
+EOF
+    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/restart-trusttunnel.sh
+  fi
 }
 
 install_mtproxy_if_needed() {
@@ -2050,6 +2142,7 @@ main() {
   fi
 
   install_prereqs
+  install_psasctl_if_possible
   install_hiddify_if_needed
   wait_hiddify
   disable_hiddify_login_menu_autorun
@@ -2084,6 +2177,10 @@ main() {
 
   /usr/local/bin/hiddify-apply-safe "$MAIN_DOMAIN"
   ensure_hiddify_units
+  request_letsencrypt_cert "$MAIN_DOMAIN"
+  if [[ "${INSTALL_TRUSTTUNNEL:-no}" == "yes" && "${TRUSTTUNNEL_DOMAIN:-}" != "$MAIN_DOMAIN" ]]; then
+    request_letsencrypt_cert "${TRUSTTUNNEL_DOMAIN}"
+  fi
   /usr/local/sbin/sync-hiddify-cert.sh "$MAIN_DOMAIN" || true
 
   collect_state
